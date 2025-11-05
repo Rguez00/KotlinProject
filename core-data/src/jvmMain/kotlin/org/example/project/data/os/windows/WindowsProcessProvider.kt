@@ -222,13 +222,20 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return map
     }
 
-    /** CPU% por proceso: lectura instantánea con Win32_PerfFormattedData_PerfProc_Process. */
-    /** CPU% por proceso: lectura instantánea con Win32_PerfFormattedData_PerfProc_Process. */
+    /** CPU% por proceso normalizada 0–100: dividimos por núcleos lógicos y filtramos _Total/Idle. */
     private fun readCpuSample(): Map<Long, Double> {
         val ps = """
         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+        ${'$'}cores = [int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors;
+
         Get-CimInstance Win32_PerfFormattedData_PerfProc_Process |
-          Select-Object IDProcess, PercentProcessorTime |
+          Where-Object { ${'$'}_.IDProcess -ne ${'$'}null -and ${'$'}_.Name -ne '_Total' } |
+          Select-Object IDProcess,
+            @{ n='CPU'; e = {
+                  if ( ${'$'}cores -gt 0 ) {
+                      [math]::Min(100, [math]::Max(0, ( ${'$'}_.PercentProcessorTime / ${'$'}cores )))
+                  } else { 0 }
+              } } |
           ConvertTo-Csv -NoTypeInformation -Delimiter '§'
     """.trimIndent()
 
@@ -236,22 +243,23 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         val lines = csv.lines().filter { it.isNotBlank() }
         if (lines.size <= 1) return emptyMap()
 
-        // sin argumentos nombrados
         val header = splitCsvLine(lines.first(), '§')
         val pidIdx = header.indexOfFirst { it.equals("IDProcess", true) }
-        val cpuIdx = header.indexOfFirst { it.equals("PercentProcessorTime", true) }
+        val cpuIdx = header.indexOfFirst { it.equals("CPU", true) }
         if (pidIdx == -1 || cpuIdx == -1) return emptyMap()
 
         val out = HashMap<Long, Double>()
         lines.drop(1).forEach { line ->
             val cols = splitCsvLine(line, '§')
             val pid = cols.getOrNull(pidIdx)?.toLongOrNull() ?: return@forEach
+            if (pid == 0L) return@forEach  // ignora System Idle Process
             val cpu = cols.getOrNull(cpuIdx)?.toDoubleOrNull() ?: 0.0
-            // redondeo a 1 decimal
             out[pid] = kotlin.math.round(cpu * 10.0) / 10.0
         }
         return out
     }
+
+
 
 
     /** Ejecuta PowerShell con salida UTF-8 (evita CSV vacíos por locale/BOM). */
