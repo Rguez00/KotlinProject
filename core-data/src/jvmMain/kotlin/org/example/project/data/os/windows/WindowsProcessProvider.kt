@@ -17,10 +17,11 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         val totalRam = totalRamBytes().coerceAtLeast(1L).toDouble()
 
         // 2) Enriquecimientos (tolerantes a fallo)
-        val wmiMap  = readWmiCsv()              // PID -> (WS bytes, user, cmd)
-        val wmicMap = if (wmiMap.isEmpty()) readWmicCsv() else emptyMap() // fallback
-        val cpuMap  = readCpuSample()           // PID -> cpu%
-        val userMap = readUserMap()             // PID -> user (IncludeUserName)
+        val wmiMap   = readWmiCsv()                              // PID -> (WS bytes, user, cmd)
+        val wmicMap  = if (wmiMap.isEmpty()) readWmicCsv() else emptyMap() // fallback WMI
+        val cpuMap   = readCpuSample()                           // PID -> cpu%
+        val userMapWmi = readUserMap()                           // PID -> user (GetOwner)
+        val userMapTasklistV = readUsersFromTasklistV()          // PID -> user (tasklist /V)
 
         // 3) Merge
         val items = taskRows.map { t ->
@@ -28,16 +29,20 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
             val m = w ?: wmicMap[t.pid]
 
             val memPctFromTask = (t.memKb * 1024.0 / totalRam) * 100.0
-            val memPct = m?.workingSet?.let { (it / totalRam) * 100.0 } ?: memPctFromTask
+            val memPctRaw = m?.workingSet?.let { (it / totalRam) * 100.0 } ?: memPctFromTask
+            val memPct = round(memPctRaw * 10.0) / 10.0
 
-            val rawCpu = cpuMap[t.pid] ?: 0.0
-            val cpuPct = round(rawCpu * 10.0) / 10.0
+            val cpuPct = cpuMap[t.pid] ?: 0.0
 
-            // Prioridad usuario: IncludeUserName -> WMI/WMIC -> "?"
-            val user = userMap[t.pid] ?: m?.user ?: "?"
+            // Prioridad de usuario: tasklist /V -> GetOwner() -> WMI/WMIC -> "?"
+            val user = userMapTasklistV[t.pid]
+                ?: userMapWmi[t.pid]
+                ?: m?.user
+                ?: "?"
 
-            // Limpia prefijo \??\ en algunas rutas de CommandLine
-            val cmd = m?.command?.replace("""^\?\?\\+""".toRegex(), "")
+            // Limpia prefijo \\??\ en algunas rutas de CommandLine
+            val cmdRaw = m?.command
+            val cmd = cmdRaw?.replaceFirst("^\\\\\\\\\\?\\\\\\\\".toRegex(), "")
 
             val state = if (cpuPct > 0.0) ProcState.RUNNING else ProcState.OTHER
 
@@ -164,71 +169,90 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return map
     }
 
-    /** 2c) Usuarios vía Get-Process -IncludeUserName (mejor cobertura que GetOwner en algunos casos). */
+    /** 2c) Usuario por PID desde tasklist /V (columna "User Name"). */
+    private fun readUsersFromTasklistV(): Map<Long, String> {
+        val p = ProcessBuilder("cmd", "/c", "tasklist /V /FO CSV /NH")
+            .redirectErrorStream(true)
+            .start()
+        val text = String(p.inputStream.readAllBytes(), Charset.forName("Cp1252")).trim()
+        p.waitFor()
+        if (text.isBlank()) return emptyMap()
+
+        // "Image Name","PID","Session Name","Session#","Mem Usage","Status","User Name","CPU Time","Window Title"
+        val map = HashMap<Long, String>()
+        text.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+            val cols = splitCsvLine(line, ',')
+            if (cols.size < 7) return@forEach
+            val pid  = cols[1].trim('"').toLongOrNull() ?: return@forEach
+            val user = cols[6].trim('"')
+            if (user.isNotBlank() && !user.equals("N/A", true)) {
+                map[pid] = user
+            }
+        }
+        return map
+    }
+
+    /** Mapa PID -> "DOMINIO\usuario" usando GetOwner(); */
     private fun readUserMap(): Map<Long, String> {
         val ps = """
-            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
-            Get-Process -IncludeUserName |
-              Select-Object Id, UserName |
-              ConvertTo-Csv -NoTypeInformation -Delimiter '§'
-        """.trimIndent()
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+        Get-CimInstance Win32_Process | ForEach-Object {
+          ${'$'}o = ${'$'}_.GetOwner();
+          ${'$'}user = if (${'$'}o) { "${'$'}(${'$'}o.Domain)\${'$'}(${'$'}o.User)" } else { "" };
+          [pscustomobject]@{ Id = ${'$'}_.ProcessId; User = ${'$'}user }
+        } | ConvertTo-Csv -NoTypeInformation -Delimiter '§'
+    """.trimIndent()
+
         val csv = runPsUtf8(ps).trim()
         val lines = csv.lines().filter { it.isNotBlank() }
         if (lines.size <= 1) return emptyMap()
 
         val header = splitCsvLine(lines.first(), '§')
         val idIdx  = header.indexOfFirst { it.equals("Id", true) }
-        val usrIdx = header.indexOfFirst { it.equals("UserName", true) }
+        val usrIdx = header.indexOfFirst { it.equals("User", true) }
         if (idIdx == -1 || usrIdx == -1) return emptyMap()
 
         val map = HashMap<Long, String>()
         lines.drop(1).forEach { line ->
             val cols = splitCsvLine(line, '§')
-            val pid = cols.getOrNull(idIdx)?.toLongOrNull() ?: return@forEach
-            val user = cols.getOrNull(usrIdx)?.ifBlank { null } ?: return@forEach
+            val pid  = cols.getOrNull(idIdx)?.toLongOrNull() ?: return@forEach
+            val user = cols.getOrNull(usrIdx)?.takeIf { it.isNotBlank() } ?: return@forEach
             map[pid] = user
         }
         return map
     }
 
-    /** 3) CPU%: muestreo de 1.5 s con Get-Process (CPU acumulada en segundos). */
+    /** CPU% por proceso: lectura instantánea con Win32_PerfFormattedData_PerfProc_Process. */
+    /** CPU% por proceso: lectura instantánea con Win32_PerfFormattedData_PerfProc_Process. */
     private fun readCpuSample(): Map<Long, Double> {
         val ps = """
-            ${'$'}cores = [int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors;
-            ${'$'}p1 = Get-Process | Select-Object Id, CPU;
-            Start-Sleep -Milliseconds 1500;
-            ${'$'}p2 = Get-Process | Select-Object Id, CPU;
-            ${'$'}h = @{}; ${'$'}p1 | ForEach-Object { ${'$'}h[${'$'}_.Id] = ${'$'}_.CPU }
-            ${'$'}result = foreach (${ '$' }p in ${ '$' }p2) {
-              ${'$'}id = ${'$'}p.Id; ${'$'}c2 = ${'$'}p.CPU; ${'$'}c1 = ${'$'}h[${'$'}id];
-              if ( ${'$'}c1 -ne ${'$'}null -and ${'$'}c2 -ne ${'$'}null ) {
-                ${'$'}delta = ${'$'}c2 - ${'$'}c1;  # seg CPU en 1.5s
-                ${'$'}pct = if ( ${'$'}delta -gt 0 ) { ( ${'$'}delta / 1.5 ) * 100 / ${'$'}cores } else { 0 };
-                if ( ${'$'}pct -gt 0 -and ${'$'}pct -lt 0.1 ) { ${'$'}pct = 0.1 }  # mínimo visible
-                [pscustomobject]@{ pid=${'$'}id; cpu=[math]::Round(${ '$' }pct,1) }
-              }
-            }
-            ${'$'}result | ConvertTo-Csv -NoTypeInformation -Delimiter '§'
-        """.trimIndent()
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+        Get-CimInstance Win32_PerfFormattedData_PerfProc_Process |
+          Select-Object IDProcess, PercentProcessorTime |
+          ConvertTo-Csv -NoTypeInformation -Delimiter '§'
+    """.trimIndent()
 
         val csv = runPsUtf8(ps).trim()
         val lines = csv.lines().filter { it.isNotBlank() }
         if (lines.size <= 1) return emptyMap()
 
+        // sin argumentos nombrados
         val header = splitCsvLine(lines.first(), '§')
-        val pidIdx = header.indexOfFirst { it.equals("pid", true) }
-        val cpuIdx = header.indexOfFirst { it.equals("cpu", true) }
+        val pidIdx = header.indexOfFirst { it.equals("IDProcess", true) }
+        val cpuIdx = header.indexOfFirst { it.equals("PercentProcessorTime", true) }
         if (pidIdx == -1 || cpuIdx == -1) return emptyMap()
 
-        val map = HashMap<Long, Double>()
+        val out = HashMap<Long, Double>()
         lines.drop(1).forEach { line ->
             val cols = splitCsvLine(line, '§')
             val pid = cols.getOrNull(pidIdx)?.toLongOrNull() ?: return@forEach
             val cpu = cols.getOrNull(cpuIdx)?.toDoubleOrNull() ?: 0.0
-            map[pid] = cpu
+            // redondeo a 1 decimal
+            out[pid] = kotlin.math.round(cpu * 10.0) / 10.0
         }
-        return map
+        return out
     }
+
 
     /** Ejecuta PowerShell con salida UTF-8 (evita CSV vacíos por locale/BOM). */
     private fun runPsUtf8(body: String): String {
