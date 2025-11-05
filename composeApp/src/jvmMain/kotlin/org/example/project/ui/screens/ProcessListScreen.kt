@@ -1,7 +1,5 @@
 package org.example.project.ui
 
-import androidx.compose.material3.BasicAlertDialog
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -11,10 +9,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.runtime.*
+import androidx.compose.runtime.snapshots.SnapshotStateObserver
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -22,8 +22,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import androidx.compose.runtime.snapshotFlow
 import org.example.project.Filters
 import org.example.project.ProcessInfo
 import org.example.project.ProcState
@@ -78,25 +81,51 @@ fun ProcessListScreen() {
     val processProvider = remember { Providers.processProvider() }
     val sysProvider     = remember { Providers.systemInfoProvider() }
 
-    // Carga y autorefresco cada 2s (se cancela al cambiar filtros o refreshTick)
+    // Estado de la lista (lo subimos arriba para poder observar el scroll)
+    val listState = rememberLazyListState()
+
+    // Pausar auto-refresco mientras hay scroll (evita tirones al paginar)
+    var pauseAuto by remember { mutableStateOf(false) }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }
+            .distinctUntilChanged()
+            .collectLatest { scrolling -> pauseAuto = scrolling }
+    }
+
+    // Carga y autorefresco (IO + pausa en scroll)
     LaunchedEffect(nameFilter, userFilter, stateFilter, refreshTick) {
-        val f = Filters(
-            name = nameFilter.takeIf { it.isNotBlank() },
-            user = userFilter.takeIf { it.isNotBlank() },
-            state = stateFilter
-        )
         while (true) {
-            processes = processProvider.listProcesses(f).getOrElse { emptyList() }
-            // si el proceso seleccionado ya no existe, deselecciona
-            selected = selected?.let { sel -> processes.find { it.pid == sel.pid } }
-            summary   = sysProvider.summary().getOrElse { SystemSummary(0.0, 0.0) }
-            delay(2000L)
+            if (!pauseAuto) {
+                val f = Filters(
+                    name = nameFilter.takeIf { it.isNotBlank() },
+                    user = userFilter.takeIf { it.isNotBlank() },
+                    state = stateFilter
+                )
+
+                // Trabajo pesado en IO
+                val newProcesses = withContext(Dispatchers.IO) {
+                    processProvider.listProcesses(f)
+                }.getOrElse { emptyList() }
+
+                val newSummary = withContext(Dispatchers.IO) {
+                    sysProvider.summary()
+                }.getOrElse { SystemSummary(0.0, 0.0) }
+
+                processes = newProcesses
+
+                // si el proceso seleccionado ya no existe, deselecciona
+                selected = selected?.let { sel -> newProcesses.find { it.pid == sel.pid } }
+
+                summary = newSummary
+            }
+
+            // Cuando hay scroll refrescamos menos para suavizar
+            delay(if (pauseAuto) 400L else 2000L)
         }
     }
 
-    // Diálogo de confirmación para "Finalizar"
+    // Diálogos
     var askKill by remember { mutableStateOf(false) }
-    // Diálogo de detalles
     var showDetails by remember { mutableStateOf(false) }
 
     Column(
@@ -202,7 +231,7 @@ fun ProcessListScreen() {
 
                     Spacer(Modifier.width(12.dp))
                     OutlinedButton(
-                        onClick = { refreshTick++ },
+                        onClick = { refreshTick++ }, // refresco manual inmediato
                         colors = btnColors, contentPadding = btnPad, shape = Pill
                     ) { Text("Refrescar", color = YellowAccent) }
                     Spacer(Modifier.width(12.dp))
@@ -222,7 +251,6 @@ fun ProcessListScreen() {
                 HorizontalDivider(color = OutlineDark.copy(alpha = 0.6f))
 
                 // Lista + barra vertical
-                val listState = rememberLazyListState()
                 Box(Modifier.fillMaxSize()) {
                     LazyColumn(
                         modifier = Modifier
@@ -231,7 +259,10 @@ fun ProcessListScreen() {
                         state = listState,
                         contentPadding = PaddingValues(vertical = 6.dp)
                     ) {
-                        items(processes) { p ->
+                        items(
+                            items = processes,
+                            key = { it.pid } // clave estable por proceso
+                        ) { p ->
                             val selectedNow = selected?.pid == p.pid
                             val rowBg = if (selectedNow)
                                 MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
@@ -247,6 +278,7 @@ fun ProcessListScreen() {
                                 horizontalArrangement = Arrangement.spacedBy(COL_GAP),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                // Pequeño formateo aquí es baratísimo; no hace falta memoizar
                                 Cell(p.pid.toString(), COL_PID)
                                 Cell(p.name, COL_PROC)
                                 Cell(p.user, COL_USER)
@@ -270,8 +302,7 @@ fun ProcessListScreen() {
         }
     }
 
-    // Confirmación "Finalizar"
-    // Diálogo "Detalles" (estilado como el resto)
+    // Diálogo "Detalles"
     if (showDetails && selected != null) {
         BasicAlertDialog(onDismissRequest = { showDetails = false }) {
             Surface(
@@ -285,15 +316,11 @@ fun ProcessListScreen() {
                         .padding(20.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // Título
                     Text(
                         "Detalles del proceso",
                         style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold)
                     )
-
                     HorizontalDivider(color = OutlineDark.copy(alpha = 0.4f))
-
-                    // Contenido
                     SelectionContainer {
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text("PID: ${selected!!.pid}")
@@ -302,31 +329,20 @@ fun ProcessListScreen() {
                             Text("CPU%: ${"%.1f".format(selected!!.cpuPercent)}")
                             Text("MEM%: ${"%.1f".format(selected!!.memPercent)}")
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Estado: ")
-                                Spacer(Modifier.width(6.dp))
-                                StateBadge(selected!!.state)
+                                Text("Estado: "); Spacer(Modifier.width(6.dp)); StateBadge(selected!!.state)
                             }
-                            Text("Comando:")
-                            Text(selected!!.command ?: "—")
+                            Text("Comando:"); Text(selected!!.command ?: "—")
                         }
                     }
-
-                    // Acciones (mismo estilo que los demás botones)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
-                    ) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                         val btnColors = ButtonDefaults.outlinedButtonColors(
                             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.12f),
                             contentColor = YellowAccent
                         )
                         val btnPad = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
-
                         OutlinedButton(
                             onClick = { showDetails = false },
-                            colors = btnColors,
-                            contentPadding = btnPad,
-                            shape = Pill
+                            colors = btnColors, contentPadding = btnPad, shape = Pill
                         ) { Text("Cerrar", color = YellowAccent) }
                     }
                 }
@@ -335,6 +351,7 @@ fun ProcessListScreen() {
     }
 
 
+    // Confirmación "Finalizar"
     if (askKill && selected != null) {
         AlertDialog(
             onDismissRequest = { askKill = false },
@@ -347,7 +364,7 @@ fun ProcessListScreen() {
                     askKill = false
                     scope.launch {
                         val pid = selected!!.pid
-                        val res = processProvider.kill(pid)
+                        val res = Providers.processProvider().kill(pid)
                         if (res.isSuccess) {
                             snackbar.showSnackbar("Proceso $pid finalizado.")
                             selected = null
