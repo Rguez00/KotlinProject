@@ -1,7 +1,10 @@
 package org.example.project.ui
 
+import androidx.compose.material3.BasicAlertDialog
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -9,6 +12,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -18,18 +23,18 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.example.project.Filters
 import org.example.project.ProcessInfo
 import org.example.project.ProcState
 import org.example.project.SystemSummary
-import org.example.project.data.Providers   // <-- este es el bueno
+import org.example.project.data.Providers
 import org.example.project.ui.components.CpuChip
 import org.example.project.ui.components.MemChip
 import org.example.project.ui.components.StateBadge
 import org.example.project.ui.theme.BluePrimary
 import org.example.project.ui.theme.OutlineDark
 import org.example.project.ui.theme.YellowAccent
-// import sun.security.jca.Providers          // <-- ELIMINADO
 
 /* ==== Anchos de columnas (header = filas) ==== */
 private val COL_PID: Dp   = 64.dp
@@ -47,6 +52,7 @@ private val ROW_VP  = 8.dp
 
 private val Pill = RoundedCornerShape(28.dp)
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProcessListScreen() {
     // Filtros UI
@@ -58,8 +64,15 @@ fun ProcessListScreen() {
     var processes by remember { mutableStateOf<List<ProcessInfo>>(emptyList()) }
     var summary   by remember { mutableStateOf(SystemSummary(0.0, 0.0)) }
 
+    // Selección (simple por ahora)
+    var selected by remember { mutableStateOf<ProcessInfo?>(null) }
+
     // Trigger de recarga manual
     var refreshTick by remember { mutableStateOf(0) }
+
+    // Snackbar & scope
+    val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
 
     // Providers de SO
     val processProvider = remember { Providers.processProvider() }
@@ -74,10 +87,17 @@ fun ProcessListScreen() {
         )
         while (true) {
             processes = processProvider.listProcesses(f).getOrElse { emptyList() }
+            // si el proceso seleccionado ya no existe, deselecciona
+            selected = selected?.let { sel -> processes.find { it.pid == sel.pid } }
             summary   = sysProvider.summary().getOrElse { SystemSummary(0.0, 0.0) }
-            delay(2000L) // <-- corregido a Long
+            delay(2000L)
         }
     }
+
+    // Diálogo de confirmación para "Finalizar"
+    var askKill by remember { mutableStateOf(false) }
+    // Diálogo de detalles
+    var showDetails by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -86,6 +106,8 @@ fun ProcessListScreen() {
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        SnackbarHost(hostState = snackbar)
+
         /* ====== Cabecera + KPIs + filtros ====== */
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -165,13 +187,19 @@ fun ProcessListScreen() {
                     )
                     val btnPad = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
 
-                    OutlinedButton(onClick = {}, enabled = false, colors = btnColors, contentPadding = btnPad, shape = Pill) {
-                        Text("Finalizar", color = YellowAccent)
-                    }
+                    OutlinedButton(
+                        onClick = { askKill = true },
+                        enabled = selected != null,
+                        colors = btnColors, contentPadding = btnPad, shape = Pill
+                    ) { Text("Finalizar", color = YellowAccent) }
+
                     Spacer(Modifier.width(12.dp))
-                    OutlinedButton(onClick = {}, enabled = false, colors = btnColors, contentPadding = btnPad, shape = Pill) {
-                        Text("Detalles", color = YellowAccent)
-                    }
+                    OutlinedButton(
+                        onClick = { showDetails = true },
+                        enabled = selected != null,
+                        colors = btnColors, contentPadding = btnPad, shape = Pill
+                    ) { Text("Detalles", color = YellowAccent) }
+
                     Spacer(Modifier.width(12.dp))
                     OutlinedButton(
                         onClick = { refreshTick++ },
@@ -188,10 +216,10 @@ fun ProcessListScreen() {
                     }
                     Spacer(Modifier.weight(1f))
                 }
-                Divider(color = OutlineDark)
+                HorizontalDivider(color = OutlineDark)
 
                 HeaderRow()
-                Divider(color = OutlineDark.copy(alpha = 0.6f))
+                HorizontalDivider(color = OutlineDark.copy(alpha = 0.6f))
 
                 // Lista + barra vertical
                 val listState = rememberLazyListState()
@@ -204,9 +232,17 @@ fun ProcessListScreen() {
                         contentPadding = PaddingValues(vertical = 6.dp)
                     ) {
                         items(processes) { p ->
+                            val selectedNow = selected?.pid == p.pid
+                            val rowBg = if (selectedNow)
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+                            else
+                                Color.Transparent
+
                             Row(
                                 Modifier
                                     .fillMaxWidth()
+                                    .background(rowBg, RoundedCornerShape(8.dp))
+                                    .clickable { selected = if (selectedNow) null else p }
                                     .padding(horizontal = ROW_HP, vertical = ROW_VP),
                                 horizontalArrangement = Arrangement.spacedBy(COL_GAP),
                                 verticalAlignment = Alignment.CenterVertically
@@ -220,7 +256,7 @@ fun ProcessListScreen() {
                                 Spacer(Modifier.weight(1f))
                                 Cell(p.command ?: "", COL_CMD, maxLines = 1)
                             }
-                            Divider(color = OutlineDark.copy(alpha = 0.35f))
+                            HorizontalDivider(color = OutlineDark.copy(alpha = 0.35f))
                         }
                     }
                     VerticalScrollbar(
@@ -232,6 +268,101 @@ fun ProcessListScreen() {
                 }
             }
         }
+    }
+
+    // Confirmación "Finalizar"
+    // Diálogo "Detalles" (estilado como el resto)
+    if (showDetails && selected != null) {
+        BasicAlertDialog(onDismissRequest = { showDetails = false }) {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 6.dp
+            ) {
+                Column(
+                    modifier = Modifier
+                        .widthIn(min = 360.dp)
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    // Título
+                    Text(
+                        "Detalles del proceso",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold)
+                    )
+
+                    HorizontalDivider(color = OutlineDark.copy(alpha = 0.4f))
+
+                    // Contenido
+                    SelectionContainer {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("PID: ${selected!!.pid}")
+                            Text("Proceso: ${selected!!.name}")
+                            Text("Usuario: ${selected!!.user}")
+                            Text("CPU%: ${"%.1f".format(selected!!.cpuPercent)}")
+                            Text("MEM%: ${"%.1f".format(selected!!.memPercent)}")
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Estado: ")
+                                Spacer(Modifier.width(6.dp))
+                                StateBadge(selected!!.state)
+                            }
+                            Text("Comando:")
+                            Text(selected!!.command ?: "—")
+                        }
+                    }
+
+                    // Acciones (mismo estilo que los demás botones)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        val btnColors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.12f),
+                            contentColor = YellowAccent
+                        )
+                        val btnPad = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+
+                        OutlinedButton(
+                            onClick = { showDetails = false },
+                            colors = btnColors,
+                            contentPadding = btnPad,
+                            shape = Pill
+                        ) { Text("Cerrar", color = YellowAccent) }
+                    }
+                }
+            }
+        }
+    }
+
+
+    if (askKill && selected != null) {
+        AlertDialog(
+            onDismissRequest = { askKill = false },
+            title = { Text("Finalizar proceso") },
+            text = {
+                Text("¿Seguro que quieres finalizar el proceso ${selected!!.name} (PID ${selected!!.pid})?")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    askKill = false
+                    scope.launch {
+                        val pid = selected!!.pid
+                        val res = processProvider.kill(pid)
+                        if (res.isSuccess) {
+                            snackbar.showSnackbar("Proceso $pid finalizado.")
+                            selected = null
+                            refreshTick++
+                        } else {
+                            val msg = res.exceptionOrNull()?.message ?: "Error desconocido"
+                            snackbar.showSnackbar("No se pudo finalizar ($pid): $msg")
+                        }
+                    }
+                }) { Text("Sí, finalizar") }
+            },
+            dismissButton = {
+                TextButton(onClick = { askKill = false }) { Text("Cancelar") }
+            }
+        )
     }
 }
 
@@ -287,7 +418,7 @@ private fun FilterStateMenu(
         modifier = modifier
     ) {
         OutlinedTextField(
-            modifier = Modifier.menuAnchor(),
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable),
             readOnly = true,
             value = stateFilter?.name ?: "Estado",
             onValueChange = {},
