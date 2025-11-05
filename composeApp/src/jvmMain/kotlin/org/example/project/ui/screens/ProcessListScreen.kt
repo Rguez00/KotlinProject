@@ -383,7 +383,7 @@ private fun HeaderRow() {
         HeadCell("MEM%", COL_MEM)
         HeadCell("Estado", COL_STATE)
         Spacer(Modifier.weight(1f))
-        HeadCell("Comando", COL_CMD)
+        HeadCell("Ruta", COL_CMD)
     }
 }
 
