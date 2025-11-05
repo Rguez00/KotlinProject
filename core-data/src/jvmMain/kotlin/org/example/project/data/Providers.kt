@@ -3,27 +3,19 @@ package org.example.project.data
 import org.example.project.ProcessProvider
 import org.example.project.SystemInfoProvider
 import org.example.project.data.os.linux.LinuxProcessProvider
-import org.example.project.data.os.mac.MacProcessProvider
 import org.example.project.data.os.windows.WindowsProcessProvider
-import org.example.project.data.platform.OsDetector
-import org.example.project.data.platform.OS
+// TODO: macOS más adelante
 
-/**
- * Fábrica simple para obtener implementaciones por SO.
- * De momento, todas son stubs que devuelven listas vacías / métricas 0.
- */
 object Providers {
-    fun processProvider(): ProcessProvider = when (OsDetector.detect()) {
-        OS.WINDOWS -> WindowsProcessProvider()
-        OS.MAC     -> MacProcessProvider()
-        OS.LINUX   -> LinuxProcessProvider()
-        OS.UNKNOWN -> LinuxProcessProvider() // por defecto
+    private val osName = System.getProperty("os.name").lowercase()
+
+    fun processProvider(): ProcessProvider = when {
+        osName.contains("win")   -> WindowsProcessProvider()
+        osName.contains("linux") -> LinuxProcessProvider()
+        osName.contains("mac") || osName.contains("darwin") -> LinuxProcessProvider() // stub temporal
+        else -> LinuxProcessProvider()
     }
 
-    fun systemInfoProvider(): SystemInfoProvider = when (OsDetector.detect()) {
-        OS.WINDOWS -> WindowsProcessProvider()
-        OS.MAC     -> MacProcessProvider()
-        OS.LINUX   -> LinuxProcessProvider()
-        OS.UNKNOWN -> LinuxProcessProvider()
-    }
+    fun systemInfoProvider(): SystemInfoProvider =
+        processProvider() as SystemInfoProvider
 }

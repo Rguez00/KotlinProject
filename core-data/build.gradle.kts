@@ -9,7 +9,7 @@ kotlin {
     sourceSets {
         val jvmMain by getting {
             dependencies {
-                implementation(projects.coreDomain)
+                implementation(project(":core-domain"))
             }
         }
         val jvmTest by getting

@@ -7,16 +7,18 @@ plugins {
 kotlin {
     jvm()
     jvmToolchain(17)
+
     sourceSets {
         val jvmMain by getting {
             dependencies {
+                // Compose Desktop
                 implementation(compose.desktop.currentOs)
                 implementation(compose.material3)
-                // si los iconos molestan, comenta la siguiente línea
                 implementation(compose.materialIconsExtended)
 
-                // ⚠️ Forma clásica, NO type-safe accessor
+                // Módulos del proyecto
                 implementation(project(":core-domain"))
+                implementation(project(":core-data"))
             }
         }
         val jvmTest by getting
@@ -24,5 +26,7 @@ kotlin {
 }
 
 compose.desktop {
-    application { mainClass = "org.example.project.MainKt" }
+    application {
+        mainClass = "org.example.project.MainKt"
+    }
 }

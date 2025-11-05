@@ -17,14 +17,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
+import org.example.project.Filters
 import org.example.project.ProcessInfo
 import org.example.project.ProcState
+import org.example.project.SystemSummary
+import org.example.project.data.Providers   // <-- este es el bueno
 import org.example.project.ui.components.CpuChip
 import org.example.project.ui.components.MemChip
 import org.example.project.ui.components.StateBadge
 import org.example.project.ui.theme.BluePrimary
 import org.example.project.ui.theme.OutlineDark
 import org.example.project.ui.theme.YellowAccent
+// import sun.security.jca.Providers          // <-- ELIMINADO
 
 /* ==== Anchos de columnas (header = filas) ==== */
 private val COL_PID: Dp   = 64.dp
@@ -44,25 +49,35 @@ private val Pill = RoundedCornerShape(28.dp)
 
 @Composable
 fun ProcessListScreen() {
+    // Filtros UI
     var nameFilter by remember { mutableStateOf("") }
     var userFilter by remember { mutableStateOf("") }
     var stateFilter by remember { mutableStateOf<ProcState?>(null) }
 
-    val mock = remember { sampleData() }
-    // Lista larga para probar scroll:
-    val mockLong = remember {
-        List(120) { i ->
-            val base = sampleData()[i % sampleData().size]
-            base.copy(
-                pid = 1001L + i,
-                name = "${base.name}-${i % 7}",
-                command = (base.command ?: "/bin/cmd").plus(" --run=$i")
-            )
+    // Datos reales
+    var processes by remember { mutableStateOf<List<ProcessInfo>>(emptyList()) }
+    var summary   by remember { mutableStateOf(SystemSummary(0.0, 0.0)) }
+
+    // Trigger de recarga manual
+    var refreshTick by remember { mutableStateOf(0) }
+
+    // Providers de SO
+    val processProvider = remember { Providers.processProvider() }
+    val sysProvider     = remember { Providers.systemInfoProvider() }
+
+    // Carga y autorefresco cada 2s (se cancela al cambiar filtros o refreshTick)
+    LaunchedEffect(nameFilter, userFilter, stateFilter, refreshTick) {
+        val f = Filters(
+            name = nameFilter.takeIf { it.isNotBlank() },
+            user = userFilter.takeIf { it.isNotBlank() },
+            state = stateFilter
+        )
+        while (true) {
+            processes = processProvider.listProcesses(f).getOrElse { emptyList() }
+            summary   = sysProvider.summary().getOrElse { SystemSummary(0.0, 0.0) }
+            delay(2000L) // <-- corregido a Long
         }
     }
-
-    // Usa la larga para ver el scrollbar; cambia a `mock` si quieres la corta.
-    val data = mockLong
 
     Column(
         modifier = Modifier
@@ -94,8 +109,8 @@ fun ProcessListScreen() {
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    CpuChip("37%")
-                    MemChip("62%")
+                    CpuChip("${"%.0f".format(summary.totalCpuPercent)}%")
+                    MemChip("${"%.0f".format(summary.totalMemPercent)}%")
                     Spacer(Modifier.weight(1f))
                 }
                 Row(
@@ -140,7 +155,7 @@ fun ProcessListScreen() {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        "Procesos (${data.size})",
+                        "Procesos (${processes.size})",
                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
                     )
                     Spacer(Modifier.width(12.dp))
@@ -149,44 +164,46 @@ fun ProcessListScreen() {
                         contentColor = YellowAccent
                     )
                     val btnPad = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
-                    OutlinedButton(onClick = {}, colors = btnColors, contentPadding = btnPad, shape = Pill) {
+
+                    OutlinedButton(onClick = {}, enabled = false, colors = btnColors, contentPadding = btnPad, shape = Pill) {
                         Text("Finalizar", color = YellowAccent)
                     }
                     Spacer(Modifier.width(12.dp))
-                    OutlinedButton(onClick = {}, colors = btnColors, contentPadding = btnPad, shape = Pill) {
+                    OutlinedButton(onClick = {}, enabled = false, colors = btnColors, contentPadding = btnPad, shape = Pill) {
                         Text("Detalles", color = YellowAccent)
                     }
                     Spacer(Modifier.width(12.dp))
-                    OutlinedButton(onClick = {}, colors = btnColors, contentPadding = btnPad, shape = Pill) {
-                        Text("Refrescar", color = YellowAccent)
-                    }
+                    OutlinedButton(
+                        onClick = { refreshTick++ },
+                        colors = btnColors, contentPadding = btnPad, shape = Pill
+                    ) { Text("Refrescar", color = YellowAccent) }
                     Spacer(Modifier.width(12.dp))
                     OutlinedButton(
                         onClick = { nameFilter = ""; userFilter = ""; stateFilter = null },
                         colors = btnColors, contentPadding = btnPad, shape = Pill
                     ) { Text("Limpiar filtros", color = YellowAccent) }
                     Spacer(Modifier.width(12.dp))
-                    OutlinedButton(onClick = {}, colors = btnColors, contentPadding = btnPad, shape = Pill) {
+                    OutlinedButton(onClick = {}, enabled = false, colors = btnColors, contentPadding = btnPad, shape = Pill) {
                         Text("Exportar CSV", color = YellowAccent)
                     }
                     Spacer(Modifier.weight(1f))
                 }
                 Divider(color = OutlineDark)
 
-                HeaderRow() // encabezado alineado
+                HeaderRow()
                 Divider(color = OutlineDark.copy(alpha = 0.6f))
 
-                // Lista + barra vertical fija
+                // Lista + barra vertical
                 val listState = rememberLazyListState()
                 Box(Modifier.fillMaxSize()) {
                     LazyColumn(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(end = 10.dp), // espacio para la barra
+                            .padding(end = 10.dp),
                         state = listState,
                         contentPadding = PaddingValues(vertical = 6.dp)
                     ) {
-                        items(data) { p ->
+                        items(processes) { p ->
                             Row(
                                 Modifier
                                     .fillMaxWidth()
@@ -288,10 +305,3 @@ private fun FilterStateMenu(
         }
     }
 }
-
-/* ====== Datos de ejemplo (sin lógica real) ====== */
-private fun sampleData(): List<ProcessInfo> = listOf(
-    ProcessInfo(1001, "java",    "mario",    12.3, 3.1, ProcState.RUNNING, "/usr/bin/java -jar app.jar"),
-    ProcessInfo(1002, "chrome",  "root",     18.4, 5.7, ProcState.SLEEPING, "chrome --type=renderer"),
-    ProcessInfo(1003, "postgres","postgres",  6.1, 2.2, ProcState.ZOMBIE,  "/usr/lib/postgresql/16/bin/postgres -D data")
-)
