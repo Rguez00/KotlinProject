@@ -28,5 +28,9 @@ kotlin {
 compose.desktop {
     application {
         mainClass = "org.example.project.MainKt"
+        nativeDistributions {
+            packageName = "MonitorDeProcesos"
+            packageVersion = "1.0.0"
+        }
     }
 }
