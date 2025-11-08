@@ -35,6 +35,7 @@ import org.example.project.data.Providers
 import org.example.project.ui.components.CpuChip
 import org.example.project.ui.components.MemChip
 import org.example.project.ui.components.StateBadge
+import org.example.project.ui.components.UsageChartCard   // <-- NUEVO
 import org.example.project.ui.theme.BluePrimary
 import org.example.project.ui.theme.OutlineDark
 import org.example.project.ui.theme.YellowAccent
@@ -90,10 +91,10 @@ fun ProcessListScreen() {
     val processProvider = remember { Providers.processProvider() }
     val sysProvider     = remember { Providers.systemInfoProvider() }
 
-    // Estado de la lista (lo subimos arriba para poder observar el scroll)
+    // Estado de la lista
     val listState = rememberLazyListState()
 
-    // Pausar auto-refresco mientras hay scroll (evita tirones al paginar)
+    // Pausar auto-refresco mientras hay scroll
     var pauseAuto by remember { mutableStateOf(false) }
     LaunchedEffect(listState) {
         snapshotFlow { listState.isScrollInProgress }
@@ -107,7 +108,7 @@ fun ProcessListScreen() {
     // Estado exportación
     var exporting by remember { mutableStateOf(false) }
 
-    // --- Carga una vez con los filtros dados (reutilizable) ---
+    // --- Carga una vez con los filtros dados ---
     suspend fun fetchOnce(f: Filters) {
         val newProcesses = withContext(Dispatchers.IO) {
             processProvider.listProcesses(f)
@@ -124,7 +125,25 @@ fun ProcessListScreen() {
         if (firstLoad) firstLoad = false
     }
 
-    // --- Refresco inmediato con debounce al teclear filtros ---
+    // SERIES PARA LA GRÁFICA
+    val cpuSeries = remember { mutableStateListOf<Float>() }
+    val memSeries = remember { mutableStateListOf<Float>() }
+
+    // Muestreo ligero cada 500ms (summary total)
+    LaunchedEffect(Unit) {
+        while (true) {
+            val s = Providers.systemInfoProvider()
+                .summary()
+                .getOrElse { SystemSummary(0.0, 0.0) }
+            cpuSeries += s.totalCpuPercent.toFloat()
+            memSeries += s.totalMemPercent.toFloat()
+            if (cpuSeries.size > 60) cpuSeries.removeAt(0)   // ~30s si delay=500ms
+            if (memSeries.size > 60) memSeries.removeAt(0)
+            delay(500)
+        }
+    }
+
+    // Refresco por filtros (debounce)
     LaunchedEffect(nameFilter, userFilter, stateFilter) {
         snapshotFlow { Triple(nameFilter, userFilter, stateFilter) }
             .debounce(350)
@@ -139,7 +158,7 @@ fun ProcessListScreen() {
             }
     }
 
-    // --- Auto-refresco periódico cuando NO hay scroll ---
+    // Auto-refresco periódico cuando NO hay scroll
     LaunchedEffect(pauseAuto, refreshTick) {
         if (pauseAuto) return@LaunchedEffect
         while (!pauseAuto) {
@@ -153,7 +172,7 @@ fun ProcessListScreen() {
         }
     }
 
-    // --- Al parar el scroll, lanza un refresco inmediato ---
+    // Al parar el scroll, refresco inmediato
     LaunchedEffect(pauseAuto) {
         if (!pauseAuto) { refreshTick++ }
     }
@@ -171,12 +190,13 @@ fun ProcessListScreen() {
     ) {
         SnackbarHost(hostState = snackbar)
 
-        /* ====== Cabecera + KPIs + filtros ====== */
+        /* ====== Cabecera + KPIs + filtros + GRÁFICA ====== */
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.Top
         ) {
+            // Columna izquierda: título + chips + filtros
             Column(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -219,6 +239,15 @@ fun ProcessListScreen() {
                     )
                 }
             }
+
+            // Derecha: tarjeta con la GRÁFICA
+            UsageChartCard(
+                cpuSeries = cpuSeries,
+                memSeries = memSeries,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(150.dp)
+            )
         }
 
         /* ====== Tarjeta con tabla ====== */
@@ -504,7 +533,6 @@ private fun FilterStateMenu(
         )
         ExposedDropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             DropdownMenuItem(text = { Text("Todos") }, onClick = { onChange(null); open = false })
-            // Solo los estados utilizados en la app
             listOf(ProcState.RUNNING, ProcState.OTHER).forEach { st ->
                 DropdownMenuItem(
                     text = { Text(st.name.lowercase().replaceFirstChar { it.titlecase() }) },
@@ -571,7 +599,7 @@ suspend fun exportVisibleToCsv(
     val target = chooseCsvFile() ?: return  // cancelado por el usuario
 
     runCatching {
-        val bom = "\uFEFF" // BOM para que Excel detecte UTF-8
+        val bom = "\uFEFF" // BOM para Excel UTF-8
 
         val header = listOf("PID","Proceso","Usuario","CPU%","MEM%","Estado","Ruta")
             .joinToString(",") { csvEscape(it) }
