@@ -15,19 +15,17 @@ import androidx.compose.material3.*
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.runtime.*
-import androidx.compose.runtime.snapshots.SnapshotStateObserver
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
 import androidx.compose.runtime.snapshotFlow
 import org.example.project.Filters
 import org.example.project.ProcessInfo
@@ -40,6 +38,15 @@ import org.example.project.ui.components.StateBadge
 import org.example.project.ui.theme.BluePrimary
 import org.example.project.ui.theme.OutlineDark
 import org.example.project.ui.theme.YellowAccent
+
+// ---- imports para exportación CSV ----
+import java.awt.FileDialog
+import java.awt.Frame
+import java.io.File
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 /* ==== Anchos de columnas (header = filas) ==== */
 private val COL_PID: Dp   = 64.dp
@@ -94,8 +101,11 @@ fun ProcessListScreen() {
             .collectLatest { scrolling -> pauseAuto = scrolling }
     }
 
-    // NUEVO: overlay de primera carga
+    // Overlay de primera carga
     var firstLoad by remember { mutableStateOf(true) }
+
+    // Estado exportación
+    var exporting by remember { mutableStateOf(false) }
 
     // --- Carga una vez con los filtros dados (reutilizable) ---
     suspend fun fetchOnce(f: Filters) {
@@ -111,11 +121,10 @@ fun ProcessListScreen() {
         selected = selected?.let { sel -> newProcesses.find { it.pid == sel.pid } }
         summary = newSummary
 
-        // Oculta overlay tras el primer fetch
         if (firstLoad) firstLoad = false
     }
 
-    // --- 2.A: Refresco inmediato con debounce al teclear filtros ---
+    // --- Refresco inmediato con debounce al teclear filtros ---
     LaunchedEffect(nameFilter, userFilter, stateFilter) {
         snapshotFlow { Triple(nameFilter, userFilter, stateFilter) }
             .debounce(350)
@@ -130,7 +139,7 @@ fun ProcessListScreen() {
             }
     }
 
-    // --- 2.B: Auto-refresco periódico cuando NO hay scroll ---
+    // --- Auto-refresco periódico cuando NO hay scroll ---
     LaunchedEffect(pauseAuto, refreshTick) {
         if (pauseAuto) return@LaunchedEffect
         while (!pauseAuto) {
@@ -144,11 +153,9 @@ fun ProcessListScreen() {
         }
     }
 
-    // --- 2.C: Al parar el scroll, lanza un refresco inmediato ---
+    // --- Al parar el scroll, lanza un refresco inmediato ---
     LaunchedEffect(pauseAuto) {
-        if (!pauseAuto) {
-            refreshTick++
-        }
+        if (!pauseAuto) { refreshTick++ }
     }
 
     // Diálogos
@@ -264,15 +271,31 @@ fun ProcessListScreen() {
                             onClick = { refreshTick++ },
                             colors = btnColors, contentPadding = btnPad, shape = Pill
                         ) { Text("Refrescar", color = YellowAccent) }
+
                         Spacer(Modifier.width(12.dp))
                         OutlinedButton(
                             onClick = { nameFilter = ""; userFilter = ""; stateFilter = null },
                             colors = btnColors, contentPadding = btnPad, shape = Pill
                         ) { Text("Limpiar filtros", color = YellowAccent) }
+
                         Spacer(Modifier.width(12.dp))
-                        OutlinedButton(onClick = {}, enabled = false, colors = btnColors, contentPadding = btnPad, shape = Pill) {
-                            Text("Exportar CSV", color = YellowAccent)
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    exporting = true
+                                    try {
+                                        exportVisibleToCsv(processes, snackbar)
+                                    } finally {
+                                        exporting = false
+                                    }
+                                }
+                            },
+                            enabled = processes.isNotEmpty() && !exporting,
+                            colors = btnColors, contentPadding = btnPad, shape = Pill
+                        ) {
+                            Text(if (exporting) "Exportando…" else "Exportar CSV", color = YellowAccent)
                         }
+
                         Spacer(Modifier.weight(1f))
                     }
                     HorizontalDivider(color = OutlineDark)
@@ -291,7 +314,7 @@ fun ProcessListScreen() {
                         ) {
                             items(
                                 items = processes,
-                                key = { it.pid } // clave estable por proceso
+                                key = { it.pid }
                             ) { p ->
                                 val selectedNow = selected?.pid == p.pid
                                 val rowBg = if (selectedNow)
@@ -481,7 +504,8 @@ private fun FilterStateMenu(
         )
         ExposedDropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             DropdownMenuItem(text = { Text("Todos") }, onClick = { onChange(null); open = false })
-            ProcState.entries.forEach { st ->
+            // Solo los estados utilizados en la app
+            listOf(ProcState.RUNNING, ProcState.OTHER).forEach { st ->
                 DropdownMenuItem(
                     text = { Text(st.name.lowercase().replaceFirstChar { it.titlecase() }) },
                     onClick = { onChange(st); open = false }
@@ -531,4 +555,66 @@ private fun LoadingOverlay(
             }
         }
     }
+}
+
+/* ======================= Exportación CSV ======================= */
+
+suspend fun exportVisibleToCsv(
+    rows: List<ProcessInfo>,
+    snackbar: SnackbarHostState
+) {
+    if (rows.isEmpty()) {
+        snackbar.showSnackbar("No hay datos que exportar.")
+        return
+    }
+
+    val target = chooseCsvFile() ?: return  // cancelado por el usuario
+
+    runCatching {
+        val bom = "\uFEFF" // BOM para que Excel detecte UTF-8
+
+        val header = listOf("PID","Proceso","Usuario","CPU%","MEM%","Estado","Ruta")
+            .joinToString(",") { csvEscape(it) }
+
+        val content = buildString(rows.size * 64) {
+            append(bom)
+            appendLine(header)
+            rows.forEach { p ->
+                appendLine(listOf(
+                    p.pid.toString(),
+                    p.name,
+                    p.user,
+                    String.format("%.1f", p.cpuPercent),
+                    String.format("%.1f", p.memPercent),
+                    p.state.name,
+                    p.command ?: ""
+                ).joinToString(",") { csvEscape(it) })
+            }
+        }
+
+        Files.newBufferedWriter(target.toPath(), StandardCharsets.UTF_8).use { it.write(content) }
+    }.onSuccess {
+        snackbar.showSnackbar("CSV exportado: ${target.absolutePath}")
+    }.onFailure { e ->
+        snackbar.showSnackbar("Error al exportar: ${e.message ?: "desconocido"}")
+    }
+}
+
+private fun chooseCsvFile(): File? {
+    val ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
+    val suggested = "procesos_$ts.csv"
+    val dlg = FileDialog(null as Frame?, "Guardar CSV", FileDialog.SAVE).apply {
+        file = suggested
+        isVisible = true
+    }
+    val dir = dlg.directory ?: return null
+    val name = dlg.file ?: return null
+    val f = File(dir, name)
+    return if (f.name.lowercase().endsWith(".csv")) f else File(f.parentFile, f.name + ".csv")
+}
+
+private fun csvEscape(s: String): String {
+    val needsQuotes = s.any { it == ',' || it == '"' || it == '\n' || it == '\r' }
+    if (!needsQuotes) return s
+    return "\"" + s.replace("\"", "\"\"") + "\""
 }
