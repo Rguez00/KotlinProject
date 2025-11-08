@@ -1,7 +1,6 @@
 package org.example.project.data
 
-import org.example.project.ProcessProvider
-import org.example.project.SystemInfoProvider
+import org.example.project.*
 import org.example.project.data.os.linux.LinuxProcessProvider
 import org.example.project.data.os.windows.WindowsProcessProvider
 import org.example.project.data.platform.OS
