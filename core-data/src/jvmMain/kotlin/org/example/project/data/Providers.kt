@@ -4,18 +4,22 @@ import org.example.project.ProcessProvider
 import org.example.project.SystemInfoProvider
 import org.example.project.data.os.linux.LinuxProcessProvider
 import org.example.project.data.os.windows.WindowsProcessProvider
-// TODO: macOS más adelante
+import org.example.project.data.platform.OS
+import org.example.project.data.platform.OsDetector
 
 object Providers {
-    private val osName = System.getProperty("os.name").lowercase()
 
-    fun processProvider(): ProcessProvider = when {
-        osName.contains("win")   -> WindowsProcessProvider()
-        osName.contains("linux") -> LinuxProcessProvider()
-        osName.contains("mac") || osName.contains("darwin") -> LinuxProcessProvider() // stub temporal
-        else -> LinuxProcessProvider()
+    private val provider: ProcessProvider by lazy {
+        when (OsDetector.detect()) {
+            OS.WINDOWS -> WindowsProcessProvider()
+            OS.LINUX   -> LinuxProcessProvider()
+            else       -> error("SO no soportado: este proyecto solo da soporte a Windows y Linux.")
+        }
     }
 
+    fun processProvider(): ProcessProvider = provider
+
     fun systemInfoProvider(): SystemInfoProvider =
-        processProvider() as SystemInfoProvider
+        (provider as? SystemInfoProvider)
+            ?: error("El provider actual no implementa SystemInfoProvider.")
 }

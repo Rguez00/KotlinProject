@@ -222,18 +222,18 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return map
     }
 
-    /** CPU% por proceso normalizada 0–100: dividimos por núcleos lógicos y filtramos _Total/Idle. */
+    /** CPU% por proceso normalizada 0–100: divide por núcleos y filtra _Total/Idle. */
     private fun readCpuSample(): Map<Long, Double> {
         val ps = """
         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
-        ${'$'}cores = [int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors;
+        ${'$'}cores = [int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
 
         Get-CimInstance Win32_PerfFormattedData_PerfProc_Process |
-          Where-Object { ${'$'}_.IDProcess -ne ${'$'}null -and ${'$'}_.Name -ne '_Total' } |
+          Where-Object { ${'$'}_.IDProcess -ne ${'$'}null -and ${'$'}_.Name -ne '_Total' -and ${'$'}_.Name -ne 'Idle' } |
           Select-Object IDProcess,
             @{ n='CPU'; e = {
-                  if ( ${'$'}cores -gt 0 ) {
-                      [math]::Min(100, [math]::Max(0, ( ${'$'}_.PercentProcessorTime / ${'$'}cores )))
+                  if (${'$'}cores -gt 0) {
+                      [math]::Round([math]::Min(100, [math]::Max(0, (${'$'}_.PercentProcessorTime / ${'$'}cores))), 1)
                   } else { 0 }
               } } |
           ConvertTo-Csv -NoTypeInformation -Delimiter '§'
@@ -252,15 +252,12 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         lines.drop(1).forEach { line ->
             val cols = splitCsvLine(line, '§')
             val pid = cols.getOrNull(pidIdx)?.toLongOrNull() ?: return@forEach
-            if (pid == 0L) return@forEach  // ignora System Idle Process
+            if (pid == 0L) return@forEach
             val cpu = cols.getOrNull(cpuIdx)?.toDoubleOrNull() ?: 0.0
-            out[pid] = kotlin.math.round(cpu * 10.0) / 10.0
+            out[pid] = cpu
         }
         return out
     }
-
-
-
 
     /** Ejecuta PowerShell con salida UTF-8 (evita CSV vacíos por locale/BOM). */
     private fun runPsUtf8(body: String): String {

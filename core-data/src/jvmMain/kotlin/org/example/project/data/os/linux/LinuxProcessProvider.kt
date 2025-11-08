@@ -44,15 +44,40 @@ class LinuxProcessProvider : ProcessProvider, SystemInfoProvider {
     }
 
     override suspend fun summary(): Result<SystemSummary> = runCatching {
-        // CPU: (1 - idle) vía /proc/stat en 2 muestras, aproximado; aquí versión simple: 0.0 y lo mejoramos en Paso 4
-        // Memoria: usamos /proc/meminfo (MemTotal/MemAvailable)
+        // CPU total a partir de /proc/stat en dos muestras (≈500ms)
+        fun readCpuLine(): LongArray {
+            val line = readFile("/proc/stat").lineSequence().firstOrNull { it.startsWith("cpu ") } ?: return LongArray(0)
+            val parts = line.split(Regex("\\s+")).drop(1) // user nice system idle iowait irq softirq steal guest guest_nice
+            return parts.take(10).mapNotNull { it.toLongOrNull() }.toLongArray()
+        }
+
+        fun usagePct(a: LongArray, b: LongArray): Double {
+            if (a.size < 4 || b.size < 4) return 0.0
+            val idleA = a[3] + (a.getOrNull(4) ?: 0L)
+            val idleB = b[3] + (b.getOrNull(4) ?: 0L)
+            val totalA = a.sum()
+            val totalB = b.sum()
+            val totalD = (totalB - totalA).coerceAtLeast(1)
+            val idleD  = (idleB - idleA).coerceAtLeast(0)
+            val busyD  = (totalD - idleD).coerceAtLeast(0)
+            return (busyD.toDouble() / totalD.toDouble()) * 100.0
+        }
+
+        val a = readCpuLine()
+        Thread.sleep(500)
+        val b = readCpuLine()
+        val cpuPct = usagePct(a, b)
+
+        // Memoria desde /proc/meminfo (MemTotal/MemAvailable)
         val memInfo = readFile("/proc/meminfo")
         fun value(k: String) = Regex("$k:\\s+(\\d+)").find(memInfo)?.groupValues?.get(1)?.toDouble() ?: 0.0
         val totalKb = value("MemTotal")
         val freeKb  = value("MemAvailable")
-        val usedPct = if (totalKb > 0) ((totalKb - freeKb) / totalKb) * 100.0 else 0.0
-        SystemSummary(totalCpuPercent = 0.0, totalMemPercent = usedPct)
+        val memPct  = if (totalKb > 0) ((totalKb - freeKb) / totalKb) * 100.0 else 0.0
+
+        SystemSummary(totalCpuPercent = cpuPct.coerceIn(0.0, 100.0), totalMemPercent = memPct.coerceIn(0.0, 100.0))
     }
+
 
     private fun readFile(path: String): String =
         BufferedReader(InputStreamReader(Runtime.getRuntime().exec(arrayOf("bash","-lc","cat $path")).inputStream)).use { it.readText() }
