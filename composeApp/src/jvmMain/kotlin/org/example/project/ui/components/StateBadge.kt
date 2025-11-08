@@ -21,9 +21,6 @@ fun StateBadge(state: ProcState, modifier: Modifier = Modifier) {
 
     val (txt, bg) = when (state) {
         ProcState.RUNNING -> "Running" to ChipRunning
-        ProcState.SLEEPING -> "Sleeping" to ChipSleeping
-        ProcState.ZOMBIE -> "Zombie" to ChipZombie
-        ProcState.STOPPED -> "Stopped" to MaterialTheme.colorScheme.primary
         else -> {"Other" to MaterialTheme.colorScheme.outline}
     }
     Box(

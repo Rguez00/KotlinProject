@@ -1,5 +1,6 @@
 package org.example.project.ui
 
+import kotlinx.coroutines.flow.debounce
 import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -20,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.*
@@ -92,35 +94,60 @@ fun ProcessListScreen() {
             .collectLatest { scrolling -> pauseAuto = scrolling }
     }
 
-    // Carga y autorefresco (IO + pausa en scroll)
-    LaunchedEffect(nameFilter, userFilter, stateFilter, refreshTick) {
-        while (true) {
-            if (!pauseAuto) {
+    // NUEVO: overlay de primera carga
+    var firstLoad by remember { mutableStateOf(true) }
+
+    // --- Carga una vez con los filtros dados (reutilizable) ---
+    suspend fun fetchOnce(f: Filters) {
+        val newProcesses = withContext(Dispatchers.IO) {
+            processProvider.listProcesses(f)
+        }.getOrElse { emptyList() }
+
+        val newSummary = withContext(Dispatchers.IO) {
+            sysProvider.summary()
+        }.getOrElse { SystemSummary(0.0, 0.0) }
+
+        processes = newProcesses
+        selected = selected?.let { sel -> newProcesses.find { it.pid == sel.pid } }
+        summary = newSummary
+
+        // Oculta overlay tras el primer fetch
+        if (firstLoad) firstLoad = false
+    }
+
+    // --- 2.A: Refresco inmediato con debounce al teclear filtros ---
+    LaunchedEffect(nameFilter, userFilter, stateFilter) {
+        snapshotFlow { Triple(nameFilter, userFilter, stateFilter) }
+            .debounce(350)
+            .distinctUntilChanged()
+            .collectLatest { (n, u, s) ->
                 val f = Filters(
-                    name = nameFilter.takeIf { it.isNotBlank() },
-                    user = userFilter.takeIf { it.isNotBlank() },
-                    state = stateFilter
+                    name = n.takeIf { it.isNotBlank() },
+                    user = u.takeIf { it.isNotBlank() },
+                    state = s
                 )
-
-                // Trabajo pesado en IO
-                val newProcesses = withContext(Dispatchers.IO) {
-                    processProvider.listProcesses(f)
-                }.getOrElse { emptyList() }
-
-                val newSummary = withContext(Dispatchers.IO) {
-                    sysProvider.summary()
-                }.getOrElse { SystemSummary(0.0, 0.0) }
-
-                processes = newProcesses
-
-                // si el proceso seleccionado ya no existe, deselecciona
-                selected = selected?.let { sel -> newProcesses.find { it.pid == sel.pid } }
-
-                summary = newSummary
+                fetchOnce(f)
             }
+    }
 
-            // Cuando hay scroll refrescamos menos para suavizar
-            delay(if (pauseAuto) 400L else 2000L)
+    // --- 2.B: Auto-refresco periódico cuando NO hay scroll ---
+    LaunchedEffect(pauseAuto, refreshTick) {
+        if (pauseAuto) return@LaunchedEffect
+        while (!pauseAuto) {
+            val f = Filters(
+                name = nameFilter.takeIf { it.isNotBlank() },
+                user = userFilter.takeIf { it.isNotBlank() },
+                state = stateFilter
+            )
+            fetchOnce(f)
+            delay(2000L)
+        }
+    }
+
+    // --- 2.C: Al parar el scroll, lanza un refresco inmediato ---
+    LaunchedEffect(pauseAuto) {
+        if (!pauseAuto) {
+            refreshTick++
         }
     }
 
@@ -196,106 +223,117 @@ fun ProcessListScreen() {
             shape = RoundedCornerShape(16.dp),
             color = MaterialTheme.colorScheme.surface
         ) {
-            Column(Modifier.fillMaxSize()) {
+            // Box para superponer overlay sobre la tabla
+            Box(Modifier.fillMaxSize()) {
 
-                // Título + acciones
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = ROW_HP, vertical = ROW_VP),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Procesos (${processes.size})",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
-                    )
-                    Spacer(Modifier.width(12.dp))
-                    val btnColors = ButtonDefaults.outlinedButtonColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.12f),
-                        contentColor = YellowAccent
-                    )
-                    val btnPad = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                Column(Modifier.fillMaxSize()) {
 
-                    OutlinedButton(
-                        onClick = { askKill = true },
-                        enabled = selected != null,
-                        colors = btnColors, contentPadding = btnPad, shape = Pill
-                    ) { Text("Finalizar", color = YellowAccent) }
-
-                    Spacer(Modifier.width(12.dp))
-                    OutlinedButton(
-                        onClick = { showDetails = true },
-                        enabled = selected != null,
-                        colors = btnColors, contentPadding = btnPad, shape = Pill
-                    ) { Text("Detalles", color = YellowAccent) }
-
-                    Spacer(Modifier.width(12.dp))
-                    OutlinedButton(
-                        onClick = { refreshTick++ }, // refresco manual inmediato
-                        colors = btnColors, contentPadding = btnPad, shape = Pill
-                    ) { Text("Refrescar", color = YellowAccent) }
-                    Spacer(Modifier.width(12.dp))
-                    OutlinedButton(
-                        onClick = { nameFilter = ""; userFilter = ""; stateFilter = null },
-                        colors = btnColors, contentPadding = btnPad, shape = Pill
-                    ) { Text("Limpiar filtros", color = YellowAccent) }
-                    Spacer(Modifier.width(12.dp))
-                    OutlinedButton(onClick = {}, enabled = false, colors = btnColors, contentPadding = btnPad, shape = Pill) {
-                        Text("Exportar CSV", color = YellowAccent)
-                    }
-                    Spacer(Modifier.weight(1f))
-                }
-                HorizontalDivider(color = OutlineDark)
-
-                HeaderRow()
-                HorizontalDivider(color = OutlineDark.copy(alpha = 0.6f))
-
-                // Lista + barra vertical
-                Box(Modifier.fillMaxSize()) {
-                    LazyColumn(
+                    // Título + acciones
+                    Row(
                         modifier = Modifier
-                            .fillMaxSize()
-                            .padding(end = 10.dp),
-                        state = listState,
-                        contentPadding = PaddingValues(vertical = 6.dp)
+                            .fillMaxWidth()
+                            .padding(horizontal = ROW_HP, vertical = ROW_VP),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        items(
-                            items = processes,
-                            key = { it.pid } // clave estable por proceso
-                        ) { p ->
-                            val selectedNow = selected?.pid == p.pid
-                            val rowBg = if (selectedNow)
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
-                            else
-                                Color.Transparent
+                        Text(
+                            "Procesos (${processes.size})",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        val btnColors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.12f),
+                            contentColor = YellowAccent
+                        )
+                        val btnPad = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
 
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .background(rowBg, RoundedCornerShape(8.dp))
-                                    .clickable { selected = if (selectedNow) null else p }
-                                    .padding(horizontal = ROW_HP, vertical = ROW_VP),
-                                horizontalArrangement = Arrangement.spacedBy(COL_GAP),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                // Pequeño formateo aquí es baratísimo; no hace falta memoizar
-                                Cell(p.pid.toString(), COL_PID)
-                                Cell(p.name, COL_PROC)
-                                Cell(p.user, COL_USER)
-                                Cell("${"%.1f".format(p.cpuPercent)}%", COL_CPU)
-                                Cell("${"%.1f".format(p.memPercent)}%", COL_MEM)
-                                Box(Modifier.width(COL_STATE)) { StateBadge(p.state) }
-                                Spacer(Modifier.weight(1f))
-                                Cell(p.command ?: "", COL_CMD, maxLines = 1)
-                            }
-                            HorizontalDivider(color = OutlineDark.copy(alpha = 0.35f))
+                        OutlinedButton(
+                            onClick = { askKill = true },
+                            enabled = selected != null,
+                            colors = btnColors, contentPadding = btnPad, shape = Pill
+                        ) { Text("Finalizar", color = YellowAccent) }
+
+                        Spacer(Modifier.width(12.dp))
+                        OutlinedButton(
+                            onClick = { showDetails = true },
+                            enabled = selected != null,
+                            colors = btnColors, contentPadding = btnPad, shape = Pill
+                        ) { Text("Detalles", color = YellowAccent) }
+
+                        Spacer(Modifier.width(12.dp))
+                        OutlinedButton(
+                            onClick = { refreshTick++ },
+                            colors = btnColors, contentPadding = btnPad, shape = Pill
+                        ) { Text("Refrescar", color = YellowAccent) }
+                        Spacer(Modifier.width(12.dp))
+                        OutlinedButton(
+                            onClick = { nameFilter = ""; userFilter = ""; stateFilter = null },
+                            colors = btnColors, contentPadding = btnPad, shape = Pill
+                        ) { Text("Limpiar filtros", color = YellowAccent) }
+                        Spacer(Modifier.width(12.dp))
+                        OutlinedButton(onClick = {}, enabled = false, colors = btnColors, contentPadding = btnPad, shape = Pill) {
+                            Text("Exportar CSV", color = YellowAccent)
                         }
+                        Spacer(Modifier.weight(1f))
                     }
-                    VerticalScrollbar(
-                        modifier = Modifier
-                            .align(Alignment.CenterEnd)
-                            .fillMaxHeight(),
-                        adapter = rememberScrollbarAdapter(listState)
+                    HorizontalDivider(color = OutlineDark)
+
+                    HeaderRow()
+                    HorizontalDivider(color = OutlineDark.copy(alpha = 0.6f))
+
+                    // Lista + barra vertical
+                    Box(Modifier.fillMaxSize()) {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(end = 10.dp),
+                            state = listState,
+                            contentPadding = PaddingValues(vertical = 6.dp)
+                        ) {
+                            items(
+                                items = processes,
+                                key = { it.pid } // clave estable por proceso
+                            ) { p ->
+                                val selectedNow = selected?.pid == p.pid
+                                val rowBg = if (selectedNow)
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+                                else
+                                    Color.Transparent
+
+                                Row(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .background(rowBg, RoundedCornerShape(8.dp))
+                                        .clickable { selected = if (selectedNow) null else p }
+                                        .padding(horizontal = ROW_HP, vertical = ROW_VP),
+                                    horizontalArrangement = Arrangement.spacedBy(COL_GAP),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Cell(p.pid.toString(), COL_PID)
+                                    Cell(p.name, COL_PROC)
+                                    Cell(p.user, COL_USER)
+                                    Cell("${"%.1f".format(p.cpuPercent)}%", COL_CPU)
+                                    Cell("${"%.1f".format(p.memPercent)}%", COL_MEM)
+                                    Box(Modifier.width(COL_STATE)) { StateBadge(p.state) }
+                                    Spacer(Modifier.weight(1f))
+                                    Cell(p.command ?: "", COL_CMD, maxLines = 1)
+                                }
+                                HorizontalDivider(color = OutlineDark.copy(alpha = 0.35f))
+                            }
+                        }
+                        VerticalScrollbar(
+                            modifier = Modifier
+                                .align(Alignment.CenterEnd)
+                                .fillMaxHeight(),
+                            adapter = rememberScrollbarAdapter(listState)
+                        )
+                    }
+                }
+
+                // OVERLAY de primera carga
+                if (firstLoad) {
+                    LoadingOverlay(
+                        text = "Cargando procesos…",
+                        modifier = Modifier.fillMaxSize()
                     )
                 }
             }
@@ -331,7 +369,7 @@ fun ProcessListScreen() {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text("Estado: "); Spacer(Modifier.width(6.dp)); StateBadge(selected!!.state)
                             }
-                            Text("Comando:"); Text(selected!!.command ?: "—")
+                            Text("Ruta:"); Text(selected!!.command ?: "—")
                         }
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
@@ -349,7 +387,6 @@ fun ProcessListScreen() {
             }
         }
     }
-
 
     // Confirmación "Finalizar"
     if (askKill && selected != null) {
@@ -449,6 +486,48 @@ private fun FilterStateMenu(
                     text = { Text(st.name.lowercase().replaceFirstChar { it.titlecase() }) },
                     onClick = { onChange(st); open = false }
                 )
+            }
+        }
+    }
+}
+
+/*** Overlay reutilizable para la primera carga ***/
+@Composable
+private fun LoadingOverlay(
+    text: String,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.80f))
+    ) {
+        Surface(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(24.dp),
+            shape = RoundedCornerShape(20.dp),
+            tonalElevation = 8.dp,
+            color = MaterialTheme.colorScheme.surface
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                CircularProgressIndicator()
+                Column {
+                    Text(
+                        text,
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+                    )
+                    Text(
+                        "Esto puede tardar unos segundos la primera vez.",
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                        ),
+                        textAlign = TextAlign.Start
+                    )
+                }
             }
         }
     }

@@ -25,9 +25,6 @@ class LinuxProcessProvider : ProcessProvider, SystemInfoProvider {
             val pmem  = parts[4].toDoubleOrNull() ?: 0.0
             val state = when (parts[5].firstOrNull()?.uppercaseChar()) {
                 'R' -> ProcState.RUNNING
-                'S' -> ProcState.SLEEPING
-                'Z' -> ProcState.ZOMBIE
-                'T' -> ProcState.STOPPED
                 else -> ProcState.OTHER
             }
             val cmdline = if (parts.size >= 7) parts[6] else null

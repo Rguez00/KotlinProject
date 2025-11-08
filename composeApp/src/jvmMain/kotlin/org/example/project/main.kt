@@ -11,9 +11,10 @@ fun main() = application {
     Window(
         title = "Monitor de Procesos",
         onCloseRequest = ::exitApplication,
-        state = rememberWindowState(width = 1000.dp, height = 600.dp), // ← tamaño inicial
-        resizable = false,
+        state = rememberWindowState(width = 1200.dp, height = 700.dp), // tamaño inicial
+        resizable = false, // bloquear redimensión
     ) {
+        // Si tu AppTheme acepta parámetro darkTheme, usa AppTheme(darkTheme = true)
         AppTheme {
             ProcessListScreen()
         }
