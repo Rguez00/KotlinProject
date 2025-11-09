@@ -1,7 +1,9 @@
+import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
     alias(libs.plugins.composeMultiplatform)
-    alias(libs.plugins.composeCompiler) // NECESARIO con Kotlin 2.x
+    alias(libs.plugins.composeCompiler) // Kotlin 2.x
 }
 
 kotlin {
@@ -28,9 +30,32 @@ kotlin {
 compose.desktop {
     application {
         mainClass = "org.example.project.MainKt"
+
         nativeDistributions {
             packageName = "MonitorDeProcesos"
             packageVersion = "1.0.0"
+
+            val os = org.gradle.internal.os.OperatingSystem.current()
+            when {
+                os.isWindows -> {
+                    targetFormats(
+                        TargetFormat.Msi
+                        // TargetFormat.Exe // si tu versión lo soporta
+                    )
+                }
+                os.isLinux -> {
+                    targetFormats(
+                        TargetFormat.Deb,
+                        TargetFormat.Rpm
+                        // TargetFormat.AppImage // si tu versión lo soporta
+                    )
+                }
+                else -> {
+                    // Por si ejecutas el empaquetado en macOS
+                    targetFormats(TargetFormat.Dmg)
+                }
+            }
         }
     }
 }
+

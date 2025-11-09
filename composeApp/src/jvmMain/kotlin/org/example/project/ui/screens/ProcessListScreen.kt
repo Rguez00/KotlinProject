@@ -1,6 +1,5 @@
 package org.example.project.ui
 
-import kotlinx.coroutines.flow.debounce
 import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -12,9 +11,10 @@ import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.runtime.*
+import androidx.compose.runtime.snapshots.SnapshotStateList
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -23,10 +23,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
-import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.example.project.Filters
 import org.example.project.ProcessInfo
 import org.example.project.ProcState
@@ -35,12 +38,10 @@ import org.example.project.data.Providers
 import org.example.project.ui.components.CpuChip
 import org.example.project.ui.components.MemChip
 import org.example.project.ui.components.StateBadge
-import org.example.project.ui.components.UsageChartCard   // <-- NUEVO
+import org.example.project.ui.components.UsageChartCard
 import org.example.project.ui.theme.BluePrimary
 import org.example.project.ui.theme.OutlineDark
 import org.example.project.ui.theme.YellowAccent
-
-// ---- imports para exportación CSV ----
 import java.awt.FileDialog
 import java.awt.Frame
 import java.io.File
@@ -48,8 +49,9 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import javax.swing.SwingUtilities
 
-/* ==== Anchos de columnas (header = filas) ==== */
+/* ==== Dimensiones de columnas ==== */
 private val COL_PID: Dp   = 64.dp
 private val COL_PROC: Dp  = 120.dp
 private val COL_USER: Dp  = 120.dp
@@ -58,7 +60,7 @@ private val COL_MEM: Dp   = 80.dp
 private val COL_STATE: Dp = 120.dp
 private val COL_CMD: Dp   = 300.dp
 
-/* ==== Espaciados comunes para alinear header/filas ==== */
+/* ==== Espaciados comunes ==== */
 private val COL_GAP = 12.dp
 private val ROW_HP  = 16.dp
 private val ROW_VP  = 8.dp
@@ -68,30 +70,30 @@ private val Pill = RoundedCornerShape(28.dp)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProcessListScreen() {
-    // Filtros UI
+    // Filtros
     var nameFilter by remember { mutableStateOf("") }
     var userFilter by remember { mutableStateOf("") }
     var stateFilter by remember { mutableStateOf<ProcState?>(null) }
 
-    // Datos reales
+    // Datos (lista y resumen)
     var processes by remember { mutableStateOf<List<ProcessInfo>>(emptyList()) }
-    var summary   by remember { mutableStateOf(SystemSummary(0.0, 0.0)) }
+    var summary by remember { mutableStateOf(SystemSummary(0.0, 0.0)) }
 
-    // Selección (simple por ahora)
+    // Selección
     var selected by remember { mutableStateOf<ProcessInfo?>(null) }
 
-    // Trigger de recarga manual
+    // Trigger manual de refresco
     var refreshTick by remember { mutableStateOf(0) }
 
     // Snackbar & scope
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    // Providers de SO
+    // Providers
     val processProvider = remember { Providers.processProvider() }
     val sysProvider     = remember { Providers.systemInfoProvider() }
 
-    // Estado de la lista
+    // Estado de lista
     val listState = rememberLazyListState()
 
     // Pausar auto-refresco mientras hay scroll
@@ -105,45 +107,61 @@ fun ProcessListScreen() {
     // Overlay de primera carga
     var firstLoad by remember { mutableStateOf(true) }
 
-    // Estado exportación
+    // Exportación
     var exporting by remember { mutableStateOf(false) }
 
-    // --- Carga una vez con los filtros dados ---
+    // Carga con filtros (con protección de “no re-pintar si nada cambió”)
     suspend fun fetchOnce(f: Filters) {
-        val newProcesses = withContext(Dispatchers.IO) {
-            processProvider.listProcesses(f)
-        }.getOrElse { emptyList() }
+        val newProcesses = withContext(Dispatchers.IO) { processProvider.listProcesses(f) }
+            .getOrElse { emptyList() }
+        val newSummary = withContext(Dispatchers.IO) { sysProvider.summary() }
+            .getOrElse { SystemSummary(0.0, 0.0) }
 
-        val newSummary = withContext(Dispatchers.IO) {
-            sysProvider.summary()
-        }.getOrElse { SystemSummary(0.0, 0.0) }
+        // Evitar recomposiciones si no hay cambios relevantes
+        val sameList =
+            processes.size == newProcesses.size &&
+                    processes.zip(newProcesses).all { (a, b) ->
+                        a.pid == b.pid &&
+                                a.cpuPercent == b.cpuPercent &&
+                                a.memPercent == b.memPercent &&
+                                a.state == b.state
+                    }
 
-        processes = newProcesses
-        selected = selected?.let { sel -> newProcesses.find { it.pid == sel.pid } }
-        summary = newSummary
+        if (!sameList) {
+            processes = newProcesses
+            selected = selected?.let { sel -> newProcesses.find { it.pid == sel.pid } }
+        }
+        if (summary != newSummary) summary = newSummary
 
         if (firstLoad) firstLoad = false
     }
 
-    // SERIES PARA LA GRÁFICA
-    val cpuSeries = remember { mutableStateListOf<Float>() }
-    val memSeries = remember { mutableStateListOf<Float>() }
+    /* ===== Series para la gráfica (throttle ligero) ===== */
+    val cpuSeries: SnapshotStateList<Float> = remember { mutableStateListOf() }
+    val memSeries: SnapshotStateList<Float> = remember { mutableStateListOf() }
 
-    // Muestreo ligero cada 500ms (summary total)
     LaunchedEffect(Unit) {
+        // muestreo cada 700ms para no saturar la UI
         while (true) {
             val s = Providers.systemInfoProvider()
                 .summary()
                 .getOrElse { SystemSummary(0.0, 0.0) }
-            cpuSeries += s.totalCpuPercent.toFloat()
-            memSeries += s.totalMemPercent.toFloat()
-            if (cpuSeries.size > 60) cpuSeries.removeAt(0)   // ~30s si delay=500ms
-            if (memSeries.size > 60) memSeries.removeAt(0)
-            delay(500)
+
+            val lastCpu = cpuSeries.lastOrNull()
+            val lastMem = memSeries.lastOrNull()
+            if (lastCpu == null || kotlin.math.abs(lastCpu - s.totalCpuPercent.toFloat()) >= 0.25f) {
+                cpuSeries += s.totalCpuPercent.toFloat()
+                if (cpuSeries.size > 60) cpuSeries.removeAt(0)
+            }
+            if (lastMem == null || kotlin.math.abs(lastMem - s.totalMemPercent.toFloat()) >= 0.25f) {
+                memSeries += s.totalMemPercent.toFloat()
+                if (memSeries.size > 60) memSeries.removeAt(0)
+            }
+            delay(700)
         }
     }
 
-    // Refresco por filtros (debounce)
+    // Refresco por cambio de filtros (debounce)
     LaunchedEffect(nameFilter, userFilter, stateFilter) {
         snapshotFlow { Triple(nameFilter, userFilter, stateFilter) }
             .debounce(350)
@@ -158,7 +176,7 @@ fun ProcessListScreen() {
             }
     }
 
-    // Auto-refresco periódico cuando NO hay scroll
+    // Auto-refresco periódico cuando no hay scroll
     LaunchedEffect(pauseAuto, refreshTick) {
         if (pauseAuto) return@LaunchedEffect
         while (!pauseAuto) {
@@ -174,7 +192,7 @@ fun ProcessListScreen() {
 
     // Al parar el scroll, refresco inmediato
     LaunchedEffect(pauseAuto) {
-        if (!pauseAuto) { refreshTick++ }
+        if (!pauseAuto) refreshTick++
     }
 
     // Diálogos
@@ -190,13 +208,12 @@ fun ProcessListScreen() {
     ) {
         SnackbarHost(hostState = snackbar)
 
-        /* ====== Cabecera + KPIs + filtros + GRÁFICA ====== */
+        /* ====== Cabecera + KPIs + filtros + gráfica ====== */
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.Top
         ) {
-            // Columna izquierda: título + chips + filtros
             Column(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -224,23 +241,28 @@ fun ProcessListScreen() {
                 ) {
                     OutlinedTextField(
                         modifier = Modifier.weight(1f),
-                        value = nameFilter, onValueChange = { nameFilter = it },
-                        label = { Text("Proceso") }, singleLine = true, shape = Pill
+                        value = nameFilter,
+                        onValueChange = { nameFilter = it },
+                        label = { Text("Proceso") },
+                        singleLine = true,
+                        shape = Pill
                     )
                     OutlinedTextField(
                         modifier = Modifier.weight(1f),
-                        value = userFilter, onValueChange = { userFilter = it },
-                        label = { Text("Usuario") }, singleLine = true, shape = Pill
+                        value = userFilter,
+                        onValueChange = { userFilter = it },
+                        label = { Text("Usuario") },
+                        singleLine = true,
+                        shape = Pill
                     )
                     FilterStateMenu(
                         modifier = Modifier.width(200.dp),
                         stateFilter = stateFilter,
-                        onChange = { stateFilter = it }
+                        onChange = { newState -> stateFilter = newState }
                     )
                 }
             }
 
-            // Derecha: tarjeta con la GRÁFICA
             UsageChartCard(
                 cpuSeries = cpuSeries,
                 memSeries = memSeries,
@@ -250,7 +272,7 @@ fun ProcessListScreen() {
             )
         }
 
-        /* ====== Tarjeta con tabla ====== */
+        /* ====== Tabla ====== */
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -259,12 +281,8 @@ fun ProcessListScreen() {
             shape = RoundedCornerShape(16.dp),
             color = MaterialTheme.colorScheme.surface
         ) {
-            // Box para superponer overlay sobre la tabla
             Box(Modifier.fillMaxSize()) {
-
                 Column(Modifier.fillMaxSize()) {
-
-                    // Título + acciones
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -276,6 +294,7 @@ fun ProcessListScreen() {
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
                         )
                         Spacer(Modifier.width(12.dp))
+
                         val btnColors = ButtonDefaults.outlinedButtonColors(
                             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.12f),
                             contentColor = YellowAccent
@@ -310,10 +329,16 @@ fun ProcessListScreen() {
                         Spacer(Modifier.width(12.dp))
                         OutlinedButton(
                             onClick = {
+                                // 1) Elegimos fichero en el EDT (fuera de corrutina)
+                                val target = chooseCsvFileOnEDT() ?: return@OutlinedButton
+                                // 2) Escribimos en IO sin bloquear la UI
                                 scope.launch {
                                     exporting = true
                                     try {
-                                        exportVisibleToCsv(processes, snackbar)
+                                        writeCsvFile(target, processes)
+                                        snackbar.showSnackbar("CSV exportado: ${target.absolutePath}")
+                                    } catch (e: Exception) {
+                                        snackbar.showSnackbar("Error al exportar: ${e.message ?: "desconocido"}")
                                     } finally {
                                         exporting = false
                                     }
@@ -332,7 +357,6 @@ fun ProcessListScreen() {
                     HeaderRow()
                     HorizontalDivider(color = OutlineDark.copy(alpha = 0.6f))
 
-                    // Lista + barra vertical
                     Box(Modifier.fillMaxSize()) {
                         LazyColumn(
                             modifier = Modifier
@@ -341,15 +365,11 @@ fun ProcessListScreen() {
                             state = listState,
                             contentPadding = PaddingValues(vertical = 6.dp)
                         ) {
-                            items(
-                                items = processes,
-                                key = { it.pid }
-                            ) { p ->
+                            items(items = processes, key = { it.pid }) { p ->
                                 val selectedNow = selected?.pid == p.pid
-                                val rowBg = if (selectedNow)
-                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
-                                else
-                                    Color.Transparent
+                                val rowBg =
+                                    if (selectedNow) MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+                                    else Color.Transparent
 
                                 Row(
                                     Modifier
@@ -381,7 +401,6 @@ fun ProcessListScreen() {
                     }
                 }
 
-                // OVERLAY de primera carga
                 if (firstLoad) {
                     LoadingOverlay(
                         text = "Cargando procesos…",
@@ -392,7 +411,7 @@ fun ProcessListScreen() {
         }
     }
 
-    // Diálogo "Detalles"
+    // Detalles
     if (showDetails && selected != null) {
         BasicAlertDialog(onDismissRequest = { showDetails = false }) {
             Surface(
@@ -440,14 +459,12 @@ fun ProcessListScreen() {
         }
     }
 
-    // Confirmación "Finalizar"
+    // Confirmación “Finalizar”
     if (askKill && selected != null) {
         AlertDialog(
             onDismissRequest = { askKill = false },
             title = { Text("Finalizar proceso") },
-            text = {
-                Text("¿Seguro que quieres finalizar el proceso ${selected!!.name} (PID ${selected!!.pid})?")
-            },
+            text = { Text("¿Seguro que quieres finalizar el proceso ${selected!!.name} (PID ${selected!!.pid})?") },
             confirmButton = {
                 TextButton(onClick = {
                     askKill = false
@@ -465,14 +482,12 @@ fun ProcessListScreen() {
                     }
                 }) { Text("Sí, finalizar") }
             },
-            dismissButton = {
-                TextButton(onClick = { askKill = false }) { Text("Cancelar") }
-            }
+            dismissButton = { TextButton(onClick = { askKill = false }) { Text("Cancelar") } }
         )
     }
 }
 
-/* ====== Encabezados (mismos paddings + gap que filas) ====== */
+/* ====== Header de tabla ====== */
 @Composable
 private fun HeaderRow() {
     Row(
@@ -518,6 +533,7 @@ private fun FilterStateMenu(
     onChange: (ProcState?) -> Unit
 ) {
     var open by remember { mutableStateOf(false) }
+
     ExposedDropdownMenuBox(
         expanded = open,
         onExpandedChange = { open = !open },
@@ -543,7 +559,7 @@ private fun FilterStateMenu(
     }
 }
 
-/*** Overlay reutilizable para la primera carga ***/
+/*** Overlay reutilizable para primera carga ***/
 @Composable
 private fun LoadingOverlay(
     text: String,
@@ -585,52 +601,23 @@ private fun LoadingOverlay(
     }
 }
 
-/* ======================= Exportación CSV ======================= */
+/* ======================= Exportación CSV (segura) ======================= */
 
-suspend fun exportVisibleToCsv(
-    rows: List<ProcessInfo>,
-    snackbar: SnackbarHostState
-) {
-    if (rows.isEmpty()) {
-        snackbar.showSnackbar("No hay datos que exportar.")
-        return
-    }
-
-    val target = chooseCsvFile() ?: return  // cancelado por el usuario
-
-    runCatching {
-        val bom = "\uFEFF" // BOM para Excel UTF-8
-
-        val header = listOf("PID","Proceso","Usuario","CPU%","MEM%","Estado","Ruta")
-            .joinToString(",") { csvEscape(it) }
-
-        val content = buildString(rows.size * 64) {
-            append(bom)
-            appendLine(header)
-            rows.forEach { p ->
-                appendLine(listOf(
-                    p.pid.toString(),
-                    p.name,
-                    p.user,
-                    String.format("%.1f", p.cpuPercent),
-                    String.format("%.1f", p.memPercent),
-                    p.state.name,
-                    p.command ?: ""
-                ).joinToString(",") { csvEscape(it) })
-            }
-        }
-
-        Files.newBufferedWriter(target.toPath(), StandardCharsets.UTF_8).use { it.write(content) }
-    }.onSuccess {
-        snackbar.showSnackbar("CSV exportado: ${target.absolutePath}")
-    }.onFailure { e ->
-        snackbar.showSnackbar("Error al exportar: ${e.message ?: "desconocido"}")
-    }
-}
-
-private fun chooseCsvFile(): File? {
+// Mostrar el diálogo en el EDT de AWT y devolver el fichero elegido (o null si cancelado)
+private fun chooseCsvFileOnEDT(): File? {
     val ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
     val suggested = "procesos_$ts.csv"
+
+    val box = arrayOfNulls<File>(1)
+    if (javax.swing.SwingUtilities.isEventDispatchThread()) {
+        box[0] = showSaveDialog(suggested)
+    } else {
+        SwingUtilities.invokeAndWait { box[0] = showSaveDialog(suggested) }
+    }
+    return box[0]
+}
+
+private fun showSaveDialog(suggested: String): File? {
     val dlg = FileDialog(null as Frame?, "Guardar CSV", FileDialog.SAVE).apply {
         file = suggested
         isVisible = true
@@ -639,6 +626,35 @@ private fun chooseCsvFile(): File? {
     val name = dlg.file ?: return null
     val f = File(dir, name)
     return if (f.name.lowercase().endsWith(".csv")) f else File(f.parentFile, f.name + ".csv")
+}
+
+// Escritura del CSV en disco (IO), sin bloquear la UI
+private suspend fun writeCsvFile(target: File, rows: List<ProcessInfo>) {
+    require(rows.isNotEmpty()) { "No hay datos que exportar." }
+
+    val bom = "\uFEFF" // BOM para Excel UTF-8
+    val header = listOf("PID","Proceso","Usuario","CPU%","MEM%","Estado","Ruta")
+        .joinToString(",") { csvEscape(it) }
+
+    val content = buildString(rows.size * 64) {
+        append(bom)
+        appendLine(header)
+        rows.forEach { p ->
+            appendLine(listOf(
+                p.pid.toString(),
+                p.name,
+                p.user,
+                String.format("%.1f", p.cpuPercent),
+                String.format("%.1f", p.memPercent),
+                p.state.name,
+                p.command ?: ""
+            ).joinToString(",") { csvEscape(it) })
+        }
+    }
+
+    withContext(Dispatchers.IO) {
+        Files.newBufferedWriter(target.toPath(), StandardCharsets.UTF_8).use { it.write(content) }
+    }
 }
 
 private fun csvEscape(s: String): String {
