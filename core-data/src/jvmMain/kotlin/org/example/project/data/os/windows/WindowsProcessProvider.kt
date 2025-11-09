@@ -114,20 +114,26 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
 
     @Suppress("DEPRECATION")
     override suspend fun summary(): Result<SystemSummary> = runCatching {
-        val mx = java.lang.management.ManagementFactory.getOperatingSystemMXBean()
-                as? com.sun.management.OperatingSystemMXBean
+        // Evitar NoClassDefFoundError cuando el runtime no incluye java.management
+        val hasMx = runCatching { Class.forName("java.lang.management.ManagementFactory"); true }.getOrElse { false }
 
-        if (mx != null) {
-            val cpu   = (mx.systemCpuLoad ?: 0.0) * 100.0
-            val total = mx.totalPhysicalMemorySize.toDouble()
-            val free  = mx.freePhysicalMemorySize.toDouble()
-            val memPct = if (total > 0) ((total - free) / total) * 100.0 else 0.0
-            SystemSummary(totalCpuPercent = max(0.0, cpu), totalMemPercent = max(0.0, memPct))
-        } else {
-            val mem = readMemPercentViaWmic() ?: 0.0
-            val cpu = readCpuTotalViaTypeperf() ?: 0.0
-            SystemSummary(totalCpuPercent = max(0.0, cpu), totalMemPercent = max(0.0, mem))
+        if (hasMx) {
+            val mx = java.lang.management.ManagementFactory.getOperatingSystemMXBean()
+                    as? com.sun.management.OperatingSystemMXBean
+
+            if (mx != null) {
+                val cpu   = (mx.systemCpuLoad ?: 0.0) * 100.0
+                val total = mx.totalPhysicalMemorySize.toDouble()
+                val free  = mx.freePhysicalMemorySize.toDouble()
+                val memPct = if (total > 0) ((total - free) / total) * 100.0 else 0.0
+                return@runCatching SystemSummary(totalCpuPercent = max(0.0, cpu), totalMemPercent = max(0.0, memPct))
+            }
         }
+
+        // Fallback cuando no hay MXBean disponible en el runtime
+        val mem = readMemPercentViaWmic() ?: 0.0
+        val cpu = readCpuTotalAny() ?: 0.0        // <-- usa cascada: typeperf -> wmic -> PS
+        SystemSummary(totalCpuPercent = max(0.0, cpu), totalMemPercent = max(0.0, mem))
     }
 
     /* ===================== Implementación ===================== */
@@ -293,6 +299,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return ((t - f).toDouble() / t.toDouble()) * 100.0
     }
 
+    // (aún presente, pero ya no lo usa summary(); lo dejamos por si lo reutilizas en otro sitio)
     private fun readCpuTotalViaTypeperf(): Double? {
         val (text, exit) = runCmdRobust("""typeperf "\Processor(_Total)\% Processor Time" -sc 1""")
         if (exit != 0 || text.isBlank()) return null
@@ -301,6 +308,40 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         val raw = parts.lastOrNull()?.replace('"', ' ')?.trim()
         val num = raw?.replace(',', '.')?.toDoubleOrNull() ?: return null
         return num.coerceIn(0.0, 100.0)
+    }
+
+    /** CPU total [%] por la vía más disponible: typeperf -> wmic -> PowerShell */
+    private fun readCpuTotalAny(): Double? {
+        // 1) typeperf
+        runCmdRobust("""typeperf "\Processor(_Total)\% Processor Time" -sc 1""").let { (text, exit) ->
+            if (exit == 0 && text.isNotBlank()) {
+                val line = text.lines().lastOrNull { it.contains('%') || it.count { ch -> ch == ',' || ch == '.' } >= 1 }
+                val parts = line?.split(',')
+                val raw = parts?.lastOrNull()?.replace("\"", "")?.trim()
+                val v = raw?.replace(',', '.')?.toDoubleOrNull()
+                if (v != null) return v.coerceIn(0.0, 100.0)
+            }
+        }
+        // 2) wmic
+        runCmdRobust("wmic cpu get LoadPercentage /value").let { (text, exit) ->
+            if (exit == 0 && text.isNotBlank()) {
+                val v = text.lineSequence()
+                    .firstOrNull { it.startsWith("LoadPercentage", ignoreCase = true) }
+                    ?.substringAfter('=')?.trim()?.toDoubleOrNull()
+                if (v != null) return v.coerceIn(0.0, 100.0)
+            }
+        }
+        // 3) PowerShell Get-Counter
+        val ps = """
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+            (Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1).
+              CounterSamples[0].CookedValue
+        """.trimIndent()
+        runPsUtf8(ps).let { out ->
+            val v = out.trim().replace(',', '.').toDoubleOrNull()
+            if (v != null) return v.coerceIn(0.0, 100.0)
+        }
+        return null
     }
 
     /* ---------- PowerShell (sólo para fallback CIM) ---------- */
@@ -352,9 +393,28 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
     }
 
     private fun totalRamBytes(): Long {
-        val mx = (java.lang.management.ManagementFactory.getOperatingSystemMXBean()
-                as? com.sun.management.OperatingSystemMXBean)
-        return mx?.totalPhysicalMemorySize ?: 0L
+        // Intento 1: usar ManagementFactory si el módulo existe
+        val viaMx = runCatching {
+            Class.forName("java.lang.management.ManagementFactory")
+            val mx = java.lang.management.ManagementFactory.getOperatingSystemMXBean()
+                    as? com.sun.management.OperatingSystemMXBean
+            mx?.totalPhysicalMemorySize ?: 0L
+        }.getOrNull()
+
+        if (viaMx != null && viaMx > 0L) return viaMx
+
+        // Intento 2: WMIC (TotalVisibleMemorySize viene en KB)
+        val (text, exit) = runCmdRobust("wmic OS get TotalVisibleMemorySize /value")
+        if (exit == 0 && text.isNotBlank()) {
+            val kb = text.lineSequence()
+                .map { it.trim() }
+                .firstOrNull { it.startsWith("TotalVisibleMemorySize", ignoreCase = true) }
+                ?.substringAfter('=')?.trim()?.toLongOrNull()
+            if (kb != null && kb > 0L) return kb * 1024L
+        }
+
+        // Fallback final
+        return 0L
     }
 
     /* ---------- Log %TEMP% ---------- */
