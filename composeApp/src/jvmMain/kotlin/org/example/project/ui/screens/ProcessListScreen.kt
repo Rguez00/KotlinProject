@@ -90,6 +90,9 @@ fun ProcessListScreen() {
     // Orden
     var sort by remember { mutableStateOf(SortState()) }
 
+    // Gatillo: forzar scroll arriba tras cambiar el orden
+    var scrollTopPending by remember { mutableStateOf(false) }
+
     // Trigger manual de refresco
     var refreshTick by remember { mutableStateOf(0) }
 
@@ -208,6 +211,14 @@ fun ProcessListScreen() {
 
     // Lista ordenada (se recalcula solo si cambian datos u orden)
     val rows = remember(processes, sort) { sortRows(processes, sort) }
+
+    // >>> Forzar scroll al inicio cuando cambie el orden (solución al “salto”)
+    LaunchedEffect(sort, rows, scrollTopPending) {
+        if (scrollTopPending) {
+            listState.scrollToItem(0) // o animateScrollToItem(0) si prefieres animación
+            scrollTopPending = false
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -367,6 +378,8 @@ fun ProcessListScreen() {
                         onHeaderClick = { key ->
                             sort = if (sort.key == key) sort.copy(ascending = !sort.ascending)
                             else SortState(key, true)
+                            // activar gatillo para volver al inicio tras ordenar
+                            scrollTopPending = true
                         }
                     )
                     HorizontalDivider(color = OutlineDark.copy(alpha = 0.6f))
