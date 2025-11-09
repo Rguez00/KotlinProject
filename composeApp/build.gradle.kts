@@ -31,31 +31,37 @@ compose.desktop {
     application {
         mainClass = "org.example.project.MainKt"
 
+        // Flags de runtime para distribuciones
+        jvmArgs += listOf(
+            "-Dskiko.render.api=OPENGL",
+            "-Dskiko.vsync.enabled=true",
+            "-Dmonitor.fastMode=true",
+            "-Dmonitor.noLogs=true",
+            "-Dsun.stdout.encoding=UTF-8",
+            "-Dsun.stderr.encoding=UTF-8"
+        )
+
         nativeDistributions {
             packageName = "MonitorDeProcesos"
             packageVersion = "1.0.0"
+            vendor = "ProyectoProcesos"
 
             val os = org.gradle.internal.os.OperatingSystem.current()
             when {
                 os.isWindows -> {
-                    targetFormats(
-                        TargetFormat.Msi
-                        // TargetFormat.Exe // si tu versión lo soporta
-                    )
+                    targetFormats(TargetFormat.Msi)
+                    windows {
+                        console = false      // 👈 sin ventana de consola
+                        // perUser = true     // (opcional) instalar en perfil de usuario
+                    }
                 }
                 os.isLinux -> {
-                    targetFormats(
-                        TargetFormat.Deb,
-                        TargetFormat.Rpm
-                        // TargetFormat.AppImage // si tu versión lo soporta
-                    )
+                    targetFormats(TargetFormat.Deb, TargetFormat.Rpm)
                 }
                 else -> {
-                    // Por si ejecutas el empaquetado en macOS
                     targetFormats(TargetFormat.Dmg)
                 }
             }
         }
     }
 }
-

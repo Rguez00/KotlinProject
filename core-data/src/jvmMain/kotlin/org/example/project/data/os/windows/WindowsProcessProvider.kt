@@ -14,10 +14,19 @@ import java.time.LocalDateTime
 
 class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
 
+    /* ==== Flags de rendimiento/log ==== */
+    private val FAST_MODE: Boolean = java.lang.Boolean.getBoolean("monitor.fastMode")
+    private val NO_LOGS: Boolean = java.lang.Boolean.getBoolean("monitor.noLogs")
+
     /* ===== Rutas robustas ===== */
     private val SYS_ROOT: String = System.getenv("SystemRoot") ?: "C:\\Windows"
     private val CMD_EXE: String = "$SYS_ROOT\\System32\\cmd.exe"
     private val POWERSHELL_EXE: String = "$SYS_ROOT\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+
+    // EJECUTABLES con ruta absoluta (evita problemas de PATH en .msi/.exe)
+    private val TASKLIST_EXE: String = preferFullPath("$SYS_ROOT\\System32\\tasklist.exe", "tasklist.exe")
+    private val WMIC_EXE:     String = preferFullPath("$SYS_ROOT\\System32\\wbem\\wmic.exe", "wmic.exe")
+    private val TYPEPERF_EXE: String = preferFullPath("$SYS_ROOT\\System32\\typeperf.exe", "typeperf.exe")
 
     private fun preferFullPath(path: String, fallback: String): String =
         runCatching { Files.exists(Paths.get(path)) }.getOrDefault(false).let { if (it) path else fallback }
@@ -25,7 +34,10 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
     /* ===== Caches ===== */
     private companion object {
         private const val USER_TTL_MS = 60_000L
-        private const val CPU_TTL_MS  = 1_500L
+        private const val CPU_TTL_MS_BASE  = 1_500L
+        private const val CPU_TTL_MS_FAST  = 2_500L
+
+        private const val EXE_TTL_MS = 60_000L   // cache de rutas/WS 60s
     }
 
     @Volatile private var userCache: Map<Long, String> = emptyMap()
@@ -35,9 +47,17 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
     @Volatile private var cpuCache: Map<Long, Double> = emptyMap()
     @Volatile private var cpuCacheAt: Long = 0L
 
+    // Cache para ExecutablePath/WorkingSet (para mostrar Ruta en FAST_MODE)
+    @Volatile private var exeCache: Map<Long, EnrichedRow> = emptyMap()
+    @Volatile private var exeCacheAt: Long = 0L
+
     private fun now() = System.currentTimeMillis()
     private fun userCacheExpired() = (now() - userCacheAt) > USER_TTL_MS
-    private fun cpuCacheValid()   = (now() - cpuCacheAt) <= CPU_TTL_MS && cpuCache.isNotEmpty()
+    private fun cpuCacheValid(): Boolean {
+        val ttl = if (FAST_MODE) CPU_TTL_MS_FAST else CPU_TTL_MS_BASE
+        return (now() - cpuCacheAt) <= ttl && cpuCache.isNotEmpty()
+    }
+    private fun exeCacheExpired() = (now() - exeCacheAt) > EXE_TTL_MS
 
     /* ============================ API ============================ */
 
@@ -64,15 +84,27 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
 
             val totalRam = totalRamBytes().coerceAtLeast(1L).toDouble()
 
-            // Enriquecido: primero WMIC; si vacío, CIM (PS)
-            val wmicMap = withContext(Dispatchers.IO) { readWmicCsvExecutablePath() }
-            val wmiMap = if (wmicMap.isEmpty()) withContext(Dispatchers.IO) { readWmiCsvExecutablePath() } else emptyMap()
+            // Enriquecido:
+            // - FAST_MODE: carga/renueva cache cada 60s; el resto del tiempo usa exeCache
+            // - Normal: usa WMIC y, si vacío, CIM (PS)
+            val enrichMap: Map<Long, EnrichedRow> = withContext(Dispatchers.IO) {
+                if (FAST_MODE) {
+                    if (exeCacheExpired()) {
+                        val m = readWmicCsvExecutablePath()
+                        if (m.isNotEmpty()) { exeCache = m; exeCacheAt = now() }
+                    }
+                    exeCache
+                } else {
+                    val wmicMap = readWmicCsvExecutablePath()
+                    if (wmicMap.isNotEmpty()) wmicMap else readWmiCsvExecutablePath()
+                }
+            }
 
             val cpuMap = cpuMapDeferred.await()
             val users  = usersDeferred.await()
 
             val items = taskRows.map { t ->
-                val enrich = wmicMap[t.pid] ?: wmiMap[t.pid]
+                val enrich = enrichMap[t.pid]
 
                 val memPctFromTask = (t.memKb * 1024.0 / totalRam) * 100.0
                 val memPctRaw      = enrich?.workingSet?.let { (it / totalRam) * 100.0 } ?: memPctFromTask
@@ -80,7 +112,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
 
                 val cpuPct = cpuMap[t.pid] ?: 0.0
                 val user   = users[t.pid] ?: enrich?.user ?: "?"
-                val cmd    = enrich?.command?.replaceFirst("^\\\\\\\\\\?\\\\\\\\".toRegex(), "")
+                val cmd    = normalizeWinPath(enrich?.command)
 
                 val status = statusCache[t.pid]?.lowercase()
                 val state  = when {
@@ -114,37 +146,81 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
 
     @Suppress("DEPRECATION")
     override suspend fun summary(): Result<SystemSummary> = runCatching {
-        // Evitar NoClassDefFoundError cuando el runtime no incluye java.management
-        val hasMx = runCatching { Class.forName("java.lang.management.ManagementFactory"); true }.getOrElse { false }
+        // 1) MXBean cuando está disponible y da un valor válido
+        val hasMx = runCatching { Class.forName("java.lang.management.ManagementFactory"); true }
+            .getOrElse { false }
 
         if (hasMx) {
             val mx = java.lang.management.ManagementFactory.getOperatingSystemMXBean()
                     as? com.sun.management.OperatingSystemMXBean
 
             if (mx != null) {
-                val cpu   = (mx.systemCpuLoad ?: 0.0) * 100.0
-                val total = mx.totalPhysicalMemorySize.toDouble()
-                val free  = mx.freePhysicalMemorySize.toDouble()
-                val memPct = if (total > 0) ((total - free) / total) * 100.0 else 0.0
-                return@runCatching SystemSummary(totalCpuPercent = max(0.0, cpu), totalMemPercent = max(0.0, memPct))
+                val cpuMx = (mx.systemCpuLoad ?: -1.0) * 100.0
+                if (cpuMx >= 0.0) {
+                    val total = mx.totalPhysicalMemorySize.toDouble()
+                    val free  = mx.freePhysicalMemorySize.toDouble()
+                    val memPct = if (total > 0) ((total - free) / total) * 100.0 else 0.0
+                    return@runCatching SystemSummary(
+                        totalCpuPercent = cpuMx.coerceIn(0.0, 100.0),
+                        totalMemPercent = memPct.coerceIn(0.0, 100.0)
+                    )
+                }
             }
         }
 
-        // Fallback cuando no hay MXBean disponible en el runtime
+        // 2) typeperf (rápido) / 3) wmic / 4) PowerShell (si no es FAST_MODE)
+        val cpuDirect = if (FAST_MODE) {
+            readCpuTotalViaTypeperf()
+        } else {
+            readCpuTotalAny()
+        }
+
+        // 5) Último recurso: suma de procesos
+        val cpuFallback = cpuDirect ?: sumPerProcessCpu()
+
         val mem = readMemPercentViaWmic() ?: 0.0
-        val cpu = readCpuTotalAny() ?: 0.0        // <-- usa cascada: typeperf -> wmic -> PS
-        SystemSummary(totalCpuPercent = max(0.0, cpu), totalMemPercent = max(0.0, mem))
+        SystemSummary(
+            totalCpuPercent = cpuFallback.coerceIn(0.0, 100.0),
+            totalMemPercent = mem.coerceIn(0.0, 100.0)
+        )
     }
+
+    /** Fallback: estima CPU total sumando el % de cada proceso y capando a 100. */
+    private fun sumPerProcessCpu(): Double {
+        val map = readCpuSample()
+        // algunos contadores pueden superar 100 puntual: promediamos y capamos
+        val sum = map.values.sum()
+        return when {
+            sum.isNaN() -> 0.0
+            sum < 0.0   -> 0.0
+            else        -> sum.coerceAtMost(100.0)
+        }
+    }
+
 
     /* ===================== Implementación ===================== */
 
     private data class TaskRow(val pid: Long, val name: String, val memKb: Long)
     private data class EnrichedRow(val pid: Long, val workingSet: Double, val command: String?, val user: String)
 
-    /* ---------- CMD helper robusto (2 intentos + 2 decodificaciones) ---------- */
+    /* ---------- CMD helper robusto ---------- */
     private data class CmdResult(val out: String, val exit: Int)
+
     private fun runCmdRobust(line: String): CmdResult {
         val cmd = preferFullPath(CMD_EXE, "cmd.exe")
+
+        // En FAST_MODE probamos 1 vez directo (sin chcp) para ahorrar coste
+        if (FAST_MODE) {
+            val p = ProcessBuilder(cmd, "/c", line).redirectErrorStream(true).start()
+            val bytes = p.inputStream.readAllBytes()
+            val exit = p.waitFor()
+            val text = String(bytes, Charsets.UTF_8).ifBlank { String(bytes) }.trim()
+            if (exit == 0 && text.isNotBlank()) return CmdResult(text, 0)
+            if (!NO_LOGS) logDiag("CMD (FAST) fallo exit=$exit\nLINE:\n$line\nOUT:\n$text")
+            return CmdResult("", 1)
+        }
+
+        // Modo normal: 2 intentos (con chcp y sin chcp)
         val attempts = listOf(
             "chcp 65001>nul & $line",
             line
@@ -155,15 +231,13 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
             val bytes = p.inputStream.readAllBytes()
             val exit = p.waitFor()
 
-            // 1) intentar UTF-8
             var text = runCatching { String(bytes, Charsets.UTF_8).trim() }.getOrElse { "" }
-            // 2) si vacío o “sospechoso”, reintentar con charset por defecto
             if (text.isBlank() || text.length < 5) {
                 text = String(bytes).trim()
             }
             if (exit == 0 && text.isNotBlank()) return CmdResult(text, 0)
 
-            logDiag("CMD intento fallido (exit=$exit)\nLINE:\n$attempt\nOUT:\n$text")
+            if (!NO_LOGS) logDiag("CMD intento fallido (exit=$exit)\nLINE:\n$attempt\nOUT:\n$text")
         }
         return CmdResult("", 1)
     }
@@ -171,7 +245,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
     /* ---------- Lecturas por comandos ---------- */
 
     private fun readTasklistCsv(): List<TaskRow> {
-        val (text, exit) = runCmdRobust("tasklist /FO CSV /NH")
+        val (text, exit) = runCmdRobust("\"$TASKLIST_EXE\" /FO CSV /NH")
         if (exit != 0 || text.isBlank()) return emptyList()
         return text.lineSequence().filter { it.isNotBlank() }.mapNotNull { ln ->
             val cols = splitCsvLine(ln, ',')
@@ -184,7 +258,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
     }
 
     private fun readUsersAndStatusFromTasklistV(): Pair<Map<Long, String>, Map<Long, String>> {
-        val (text, exit) = runCmdRobust("tasklist /V /FO CSV /NH")
+        val (text, exit) = runCmdRobust("\"$TASKLIST_EXE\" /V /FO CSV /NH")
         if (exit != 0 || text.isBlank()) return emptyMap<Long, String>() to emptyMap()
 
         val users = HashMap<Long, String>()
@@ -202,7 +276,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
     }
 
     private fun readWmicCsvExecutablePath(): Map<Long, EnrichedRow> {
-        val (text, exit) = runCmdRobust("wmic process get ProcessId,ExecutablePath,WorkingSetSize /FORMAT:CSV")
+        val (text, exit) = runCmdRobust("\"$WMIC_EXE\" process get ProcessId,ExecutablePath,WorkingSetSize /FORMAT:CSV")
         if (exit != 0 || text.isBlank()) return emptyMap()
 
         val lines = text.lines().filter { it.isNotBlank() }
@@ -224,8 +298,9 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return map
     }
 
-    /** Fallback CIM (PS) sólo si WMIC no dio datos */
+    /** Fallback CIM (PS) sólo si WMIC no dio datos y NO estamos en FAST_MODE */
     private fun readWmiCsvExecutablePath(): Map<Long, EnrichedRow> {
+        if (FAST_MODE) return emptyMap()
         val psBody = """
             [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
             Get-CimInstance Win32_Process |
@@ -254,11 +329,9 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return map
     }
 
-    /* ---------- CPU% por proceso sin PS ---------- */
+    /* ---------- CPU% por proceso ---------- */
     private fun readCpuSample(): Map<Long, Double> {
-        val (text, exit) = runCmdRobust(
-            "wmic path Win32_PerfFormattedData_PerfProc_Process get IDProcess,PercentProcessorTime /FORMAT:CSV"
-        )
+        val (text, exit) = runCmdRobust("\"$WMIC_EXE\" path Win32_PerfFormattedData_PerfProc_Process get IDProcess,PercentProcessorTime /FORMAT:CSV")
         if (exit != 0 || text.isBlank()) return emptyMap()
 
         val lines = text.lines().filter { it.isNotBlank() }
@@ -282,7 +355,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
 
     /* ---------- Fallbacks resumen sin MXBean ---------- */
     private fun readMemPercentViaWmic(): Double? {
-        val (text, exit) = runCmdRobust("wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value")
+        val (text, exit) = runCmdRobust("\"$WMIC_EXE\" OS get TotalVisibleMemorySize,FreePhysicalMemory /value")
         if (exit != 0 || text.isBlank()) return null
         var total: Long? = null
         var free: Long?  = null
@@ -299,9 +372,8 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return ((t - f).toDouble() / t.toDouble()) * 100.0
     }
 
-    // (aún presente, pero ya no lo usa summary(); lo dejamos por si lo reutilizas en otro sitio)
     private fun readCpuTotalViaTypeperf(): Double? {
-        val (text, exit) = runCmdRobust("""typeperf "\Processor(_Total)\% Processor Time" -sc 1""")
+        val (text, exit) = runCmdRobust("\"$TYPEPERF_EXE\" \"\\Processor(_Total)\\% Processor Time\" -sc 1")
         if (exit != 0 || text.isBlank()) return null
         val line = text.lines().lastOrNull { it.contains('%') || it.count { ch -> ch == ',' || ch == '.' } >= 1 } ?: return null
         val parts = splitCsvLine(line, ',')
@@ -310,10 +382,10 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return num.coerceIn(0.0, 100.0)
     }
 
-    /** CPU total [%] por la vía más disponible: typeperf -> wmic -> PowerShell */
+    /** CPU total [%] por la vía más disponible: typeperf -> wmic -> PowerShell (evitado en FAST_MODE) */
     private fun readCpuTotalAny(): Double? {
         // 1) typeperf
-        runCmdRobust("""typeperf "\Processor(_Total)\% Processor Time" -sc 1""").let { (text, exit) ->
+        runCmdRobust("\"$TYPEPERF_EXE\" \"\\Processor(_Total)\\% Processor Time\" -sc 1").let { (text, exit) ->
             if (exit == 0 && text.isNotBlank()) {
                 val line = text.lines().lastOrNull { it.contains('%') || it.count { ch -> ch == ',' || ch == '.' } >= 1 }
                 val parts = line?.split(',')
@@ -323,7 +395,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
             }
         }
         // 2) wmic
-        runCmdRobust("wmic cpu get LoadPercentage /value").let { (text, exit) ->
+        runCmdRobust("\"$WMIC_EXE\" cpu get LoadPercentage /value").let { (text, exit) ->
             if (exit == 0 && text.isNotBlank()) {
                 val v = text.lineSequence()
                     .firstOrNull { it.startsWith("LoadPercentage", ignoreCase = true) }
@@ -331,15 +403,17 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
                 if (v != null) return v.coerceIn(0.0, 100.0)
             }
         }
-        // 3) PowerShell Get-Counter
-        val ps = """
-            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
-            (Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1).
-              CounterSamples[0].CookedValue
-        """.trimIndent()
-        runPsUtf8(ps).let { out ->
-            val v = out.trim().replace(',', '.').toDoubleOrNull()
-            if (v != null) return v.coerceIn(0.0, 100.0)
+        // 3) PowerShell Get-Counter (solo si NO es FAST_MODE)
+        if (!FAST_MODE) {
+            val ps = """
+                [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+                (Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1).
+                  CounterSamples[0].CookedValue
+            """.trimIndent()
+            runPsUtf8(ps).let { out ->
+                val v = out.trim().replace(',', '.').toDoubleOrNull()
+                if (v != null) return v.coerceIn(0.0, 100.0)
+            }
         }
         return null
     }
@@ -356,7 +430,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         val out = String(bytes, Charsets.UTF_8).replace("\uFEFF", "")
         val exit = p.waitFor()
         if (exit != 0 || out.isBlank()) {
-            logDiag("PowerShell exit=$exit\nBODY:\n$body\nOUT:\n$out")
+            if (!NO_LOGS) logDiag("PowerShell exit=$exit\nBODY:\n$body\nOUT:\n$out")
         }
         return out
     }
@@ -404,7 +478,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         if (viaMx != null && viaMx > 0L) return viaMx
 
         // Intento 2: WMIC (TotalVisibleMemorySize viene en KB)
-        val (text, exit) = runCmdRobust("wmic OS get TotalVisibleMemorySize /value")
+        val (text, exit) = runCmdRobust("\"$WMIC_EXE\" OS get TotalVisibleMemorySize /value")
         if (exit == 0 && text.isNotBlank()) {
             val kb = text.lineSequence()
                 .map { it.trim() }
@@ -417,8 +491,16 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return 0L
     }
 
+    private fun normalizeWinPath(raw: String?): String? = raw?.let {
+        // \\?\UNC\Server\Share\path  ->  \\Server\Share\path
+        it.replaceFirst(Regex("""^\\\\\?\\UNC\\"""), """\\""")
+            // \\?\C:\path -> C:\path
+            .replaceFirst(Regex("""^\\\\\?\\"""), "")
+    }
+
     /* ---------- Log %TEMP% ---------- */
     private fun logDiag(msg: String) {
+        if (NO_LOGS) return
         runCatching {
             val tmp = System.getProperty("java.io.tmpdir")
             val path = Paths.get(tmp, "MonitorDeProcesos.log")
