@@ -495,30 +495,76 @@ fun ProcessListScreen() {
     }
 
     // Confirmación “Finalizar”
+    // Confirmación “Finalizar” (estilo unificado con el de Detalles)
     if (askKill && selected != null) {
-        AlertDialog(
-            onDismissRequest = { askKill = false },
-            title = { Text("Finalizar proceso") },
-            text = { Text("¿Seguro que quieres finalizar el proceso ${selected!!.name} (PID ${selected!!.pid})?") },
-            confirmButton = {
-                TextButton(onClick = {
-                    askKill = false
-                    scope.launch {
-                        val pid = selected!!.pid
-                        val res = Providers.processProvider().kill(pid)
-                        if (res.isSuccess) {
-                            snackbar.showSnackbar("Proceso $pid finalizado.")
-                            selected = null
-                            refreshTick++
-                        } else {
-                            val msg = res.exceptionOrNull()?.message ?: "Error desconocido"
-                            snackbar.showSnackbar("No se pudo finalizar ($pid): $msg")
-                        }
+        BasicAlertDialog(onDismissRequest = { askKill = false }) {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 6.dp
+            ) {
+                Column(
+                    modifier = Modifier
+                        .widthIn(min = 360.dp)
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        "Finalizar proceso",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold)
+                    )
+                    HorizontalDivider(color = OutlineDark.copy(alpha = 0.4f))
+
+                    Text(
+                        "¿Seguro que quieres finalizar el proceso ${selected!!.name} (PID ${selected!!.pid})?",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        val btnPad = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+
+                        OutlinedButton(
+                            onClick = { askKill = false },
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.12f),
+                                contentColor = YellowAccent
+                            ),
+                            contentPadding = btnPad,
+                            shape = Pill
+                        ) { Text("Cancelar", color = YellowAccent) }
+
+                        Spacer(Modifier.width(10.dp))
+
+                        Button(
+                            onClick = {
+                                askKill = false
+                                scope.launch {
+                                    val pid = selected!!.pid
+                                    val res = Providers.processProvider().kill(pid)
+                                    if (res.isSuccess) {
+                                        snackbar.showSnackbar("Proceso $pid finalizado.")
+                                        selected = null
+                                        refreshTick++
+                                    } else {
+                                        val msg = res.exceptionOrNull()?.message ?: "Error desconocido"
+                                        snackbar.showSnackbar("No se pudo finalizar ($pid): $msg")
+                                    }
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = YellowAccent,
+                                contentColor = MaterialTheme.colorScheme.onPrimary // texto oscuro/contraste
+                            ),
+                            contentPadding = btnPad,
+                            shape = Pill
+                        ) { Text("Sí, finalizar") }
                     }
-                }) { Text("Sí, finalizar") }
-            },
-            dismissButton = { TextButton(onClick = { askKill = false }) { Text("Cancelar") } }
-        )
+                }
+            }
+        }
     }
 }
 

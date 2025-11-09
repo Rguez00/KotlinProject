@@ -29,7 +29,6 @@ node_modules/
 *.exe
 *.dmg
 *.AppImage
-*.tar.gz
 # (Si no quieres ignorar todos los ZIP, deja comentado este)
 # *.zip
 
