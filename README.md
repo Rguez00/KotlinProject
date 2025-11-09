@@ -1,27 +1,58 @@
-This is a Kotlin Multiplatform project targeting Desktop (JVM).
+# Monitor de Procesos (Compose for Desktop)
 
-* [/composeApp](./composeApp/src) is for code that will be shared across your Compose Multiplatform applications.
-  It contains several subfolders:
-  - [commonMain](./composeApp/src/commonMain/kotlin) is for code that’s common for all targets.
-  - Other folders are for Kotlin code that will be compiled for only the platform indicated in the folder name.
-    For example, if you want to use Apple’s CoreCrypto for the iOS part of your Kotlin app,
-    the [iosMain](./composeApp/src/iosMain/kotlin) folder would be the right place for such calls.
-    Similarly, if you want to edit the Desktop (JVM) specific part, the [jvmMain](./composeApp/src/jvmMain/kotlin)
-    folder is the appropriate location.
+Aplicación de escritorio en **Kotlin + Compose** para **listar procesos** del sistema con:
+**ordenación por cabecera**, **filtros** (Proceso/Usuario/Estado), **auto-refresco**,
+**detalles** y **exportación a CSV**. Proyecto de **DI/PSP – 2º DAM**.
 
-### Build and Run Desktop (JVM) Application
+- **Repositorio:** https://github.com/Rguez00/KotlinProject
+- **Memoria (PDF):** ver `/docs/Memoria_Final.pdf` (estructura completa, pruebas y anexos)
+- **Descargas listas para usar (artefactos de entrega):**
+    - `MonitorDeProcesosWindows.zip` → ejecutable/instalador para **Windows 10/11**
+    - `MonitorDeProcesosUbuntu.zip` → binario/paquete para **Ubuntu 22.04/24.04**
 
-To build and run the development version of the desktop app, use the run configuration from the run widget
-in your IDE’s toolbar or run it directly from the terminal:
-- on macOS/Linux
-  ```shell
-  ./gradlew :composeApp:run
-  ```
-- on Windows
-  ```shell
-  .\gradlew.bat :composeApp:run
-  ```
+> El README es un **resumen**; la explicación detallada está en el PDF.
 
 ---
 
-Learn more about [Kotlin Multiplatform](https://www.jetbrains.com/help/kotlin-multiplatform-dev/get-started.html)…
+## 🚀 Uso rápido
+
+**Windows**
+1. Descarga `MonitorDeProcesosWindows.zip` y descomprímelo.
+2. Ejecuta el **.exe** (o el lanzador incluido).  
+   En el primer arranque verás “**Cargando procesos…**”.
+
+**Ubuntu**
+1. Descarga `MonitorDeProcesosUbuntu.zip` y descomprímelo.
+2. Si es binario: `chmod +x ./MonitorDeProcesos` y ejecútalo.  
+   Si incluye `.deb/.rpm`, instala con tu gestor de paquetes.
+
+---
+
+## ✨ Qué hace
+- **Tabla** con: PID · Proceso · Usuario · CPU% · MEM% · Estado · Ruta
+- **Ordenación** por cabecera (asc/desc) con indicador
+- **Filtros** por Proceso/Usuario y **Estado** (Running/Other)
+- **Auto-refresco** configurable + botón **Refrescar**
+- **Detalles** del proceso (PID, usuario, ruta/cmdline, métricas)
+- **Exportar CSV** (UTF-8) respetando el **filtro** y la **ordenación** actuales
+
+> Algunas métricas pueden mostrarse **N/D** según permisos/políticas del SO.
+
+---
+
+## 🧩 Tecnologías (resumen)
+- **Kotlin/JVM** · **Compose for Desktop**
+- Providers por SO:
+    - **Windows:** contadores (PowerShell `Get-Counter` / `typeperf`)
+    - **Linux:** `ps` + **/proc**
+- Empaquetado con `:composeApp:createDistributable`
+
+---
+
+## 🛠️ Desarrollo (opcional)
+```bash
+# macOS/Linux
+./gradlew :composeApp:run
+
+# Windows
+.\gradlew.bat :composeApp:run
