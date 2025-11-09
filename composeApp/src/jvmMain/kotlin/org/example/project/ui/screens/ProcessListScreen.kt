@@ -2,6 +2,7 @@ package org.example.project.ui
 
 import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -67,6 +68,10 @@ private val ROW_VP  = 8.dp
 
 private val Pill = RoundedCornerShape(28.dp)
 
+/* ==== Ordenación ==== */
+private enum class SortKey { PID, NAME, USER, CPU, MEM, STATE }
+private data class SortState(val key: SortKey = SortKey.NAME, val ascending: Boolean = true)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProcessListScreen() {
@@ -81,6 +86,9 @@ fun ProcessListScreen() {
 
     // Selección
     var selected by remember { mutableStateOf<ProcessInfo?>(null) }
+
+    // Orden
+    var sort by remember { mutableStateOf(SortState()) }
 
     // Trigger manual de refresco
     var refreshTick by remember { mutableStateOf(0) }
@@ -117,7 +125,6 @@ fun ProcessListScreen() {
         val newSummary = withContext(Dispatchers.IO) { sysProvider.summary() }
             .getOrElse { SystemSummary(0.0, 0.0) }
 
-        // Evitar recomposiciones si no hay cambios relevantes
         val sameList =
             processes.size == newProcesses.size &&
                     processes.zip(newProcesses).all { (a, b) ->
@@ -198,6 +205,9 @@ fun ProcessListScreen() {
     // Diálogos
     var askKill by remember { mutableStateOf(false) }
     var showDetails by remember { mutableStateOf(false) }
+
+    // Lista ordenada (se recalcula solo si cambian datos u orden)
+    val rows = remember(processes, sort) { sortRows(processes, sort) }
 
     Column(
         modifier = Modifier
@@ -290,7 +300,7 @@ fun ProcessListScreen() {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            "Procesos (${processes.size})",
+                            "Procesos (${rows.size})",
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
                         )
                         Spacer(Modifier.width(12.dp))
@@ -329,13 +339,11 @@ fun ProcessListScreen() {
                         Spacer(Modifier.width(12.dp))
                         OutlinedButton(
                             onClick = {
-                                // 1) Elegimos fichero en el EDT (fuera de corrutina)
                                 val target = chooseCsvFileOnEDT() ?: return@OutlinedButton
-                                // 2) Escribimos en IO sin bloquear la UI
                                 scope.launch {
                                     exporting = true
                                     try {
-                                        writeCsvFile(target, processes)
+                                        writeCsvFile(target, rows)
                                         snackbar.showSnackbar("CSV exportado: ${target.absolutePath}")
                                     } catch (e: Exception) {
                                         snackbar.showSnackbar("Error al exportar: ${e.message ?: "desconocido"}")
@@ -344,7 +352,7 @@ fun ProcessListScreen() {
                                     }
                                 }
                             },
-                            enabled = processes.isNotEmpty() && !exporting,
+                            enabled = rows.isNotEmpty() && !exporting,
                             colors = btnColors, contentPadding = btnPad, shape = Pill
                         ) {
                             Text(if (exporting) "Exportando…" else "Exportar CSV", color = YellowAccent)
@@ -354,7 +362,13 @@ fun ProcessListScreen() {
                     }
                     HorizontalDivider(color = OutlineDark)
 
-                    HeaderRow()
+                    HeaderRow(
+                        sort = sort,
+                        onHeaderClick = { key ->
+                            sort = if (sort.key == key) sort.copy(ascending = !sort.ascending)
+                            else SortState(key, true)
+                        }
+                    )
                     HorizontalDivider(color = OutlineDark.copy(alpha = 0.6f))
 
                     Box(Modifier.fillMaxSize()) {
@@ -365,15 +379,23 @@ fun ProcessListScreen() {
                             state = listState,
                             contentPadding = PaddingValues(vertical = 6.dp)
                         ) {
-                            items(items = processes, key = { it.pid }) { p ->
+                            items(items = rows, key = { it.pid }) { p ->
                                 val selectedNow = selected?.pid == p.pid
-                                val rowBg =
-                                    if (selectedNow) MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
-                                    else Color.Transparent
+
+                                val rowBg = if (selectedNow)
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                                else
+                                    Color.Transparent
+
+                                val borderColor = if (selectedNow)
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+                                else
+                                    Color.Transparent
 
                                 Row(
                                     Modifier
                                         .fillMaxWidth()
+                                        .border(1.dp, borderColor, RoundedCornerShape(8.dp))
                                         .background(rowBg, RoundedCornerShape(8.dp))
                                         .clickable { selected = if (selectedNow) null else p }
                                         .padding(horizontal = ROW_HP, vertical = ROW_VP),
@@ -487,9 +509,12 @@ fun ProcessListScreen() {
     }
 }
 
-/* ====== Header de tabla ====== */
+/* ====== Header de tabla con ordenación ====== */
 @Composable
-private fun HeaderRow() {
+private fun HeaderRow(
+    sort: SortState,
+    onHeaderClick: (SortKey) -> Unit
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -497,22 +522,44 @@ private fun HeaderRow() {
             .padding(horizontal = ROW_HP, vertical = ROW_VP),
         horizontalArrangement = Arrangement.spacedBy(COL_GAP)
     ) {
-        HeadCell("PID", COL_PID)
-        HeadCell("Proceso", COL_PROC)
-        HeadCell("Usuario", COL_USER)
-        HeadCell("CPU%", COL_CPU)
-        HeadCell("MEM%", COL_MEM)
-        HeadCell("Estado", COL_STATE)
+        HeadCell("PID", COL_PID, SortKey.PID, sort, onHeaderClick)
+        HeadCell("Proceso", COL_PROC, SortKey.NAME, sort, onHeaderClick)
+        HeadCell("Usuario", COL_USER, SortKey.USER, sort, onHeaderClick)
+        HeadCell("CPU%", COL_CPU, SortKey.CPU, sort, onHeaderClick)
+        HeadCell("MEM%", COL_MEM, SortKey.MEM, sort, onHeaderClick)
+        HeadCell("Estado", COL_STATE, SortKey.STATE, sort, onHeaderClick)
         Spacer(Modifier.weight(1f))
-        HeadCell("Ruta", COL_CMD)
+        Text(
+            "Ruta",
+            modifier = Modifier.width(COL_CMD),
+            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
+        )
     }
 }
 
-@Composable private fun HeadCell(text: String, width: Dp) {
+@Composable
+private fun HeadCell(
+    text: String,
+    width: Dp,
+    key: SortKey,
+    sort: SortState,
+    onClick: (SortKey) -> Unit
+) {
+    val isActive = sort.key == key
+    val arrow = when {
+        !isActive -> ""
+        sort.ascending -> " ▲"
+        else -> " ▼"
+    }
     Text(
-        text,
-        modifier = Modifier.width(width),
-        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
+        text = text + arrow,
+        modifier = Modifier
+            .width(width)
+            .clickable { onClick(key) },
+        style = MaterialTheme.typography.labelLarge.copy(
+            fontWeight = if (isActive) FontWeight.Bold else FontWeight.SemiBold),
+        color = if (isActive) MaterialTheme.colorScheme.onSurface
+        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
     )
 }
 
@@ -603,7 +650,6 @@ private fun LoadingOverlay(
 
 /* ======================= Exportación CSV (segura) ======================= */
 
-// Mostrar el diálogo en el EDT de AWT y devolver el fichero elegido (o null si cancelado)
 private fun chooseCsvFileOnEDT(): File? {
     val ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
     val suggested = "procesos_$ts.csv"
@@ -628,11 +674,10 @@ private fun showSaveDialog(suggested: String): File? {
     return if (f.name.lowercase().endsWith(".csv")) f else File(f.parentFile, f.name + ".csv")
 }
 
-// Escritura del CSV en disco (IO), sin bloquear la UI
 private suspend fun writeCsvFile(target: File, rows: List<ProcessInfo>) {
     require(rows.isNotEmpty()) { "No hay datos que exportar." }
 
-    val bom = "\uFEFF" // BOM para Excel UTF-8
+    val bom = "\uFEFF"
     val header = listOf("PID","Proceso","Usuario","CPU%","MEM%","Estado","Ruta")
         .joinToString(",") { csvEscape(it) }
 
@@ -661,4 +706,17 @@ private fun csvEscape(s: String): String {
     val needsQuotes = s.any { it == ',' || it == '"' || it == '\n' || it == '\r' }
     if (!needsQuotes) return s
     return "\"" + s.replace("\"", "\"\"") + "\""
+}
+
+/* ====== Util ordenación ====== */
+private fun sortRows(rows: List<ProcessInfo>, s: SortState): List<ProcessInfo> {
+    val base = when (s.key) {
+        SortKey.PID   -> rows.sortedBy { it.pid }
+        SortKey.NAME  -> rows.sortedBy { it.name.lowercase() }
+        SortKey.USER  -> rows.sortedBy { it.user.lowercase() }
+        SortKey.CPU   -> rows.sortedBy { it.cpuPercent }
+        SortKey.MEM   -> rows.sortedBy { it.memPercent }
+        SortKey.STATE -> rows.sortedBy { it.state.name }
+    }
+    return if (s.ascending) base else base.asReversed()
 }
