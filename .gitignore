@@ -17,3 +17,23 @@ captures
 !*.xcworkspace/contents.xcworkspacedata
 **/xcshareddata/WorkspaceSettings.xcsettings
 node_modules/
+# Instalable/ejecutables grandes (no subir al repo)
+# ZIPs concretos en la raíz
+/EjecutableEinstallUbuntu.zip
+/EjecutableEinstallWindows.zip
+
+# Por si generas más paquetes/artefactos
+*.deb
+*.rpm
+*.msi
+*.exe
+*.dmg
+*.AppImage
+*.tar.gz
+# (Si no quieres ignorar todos los ZIP, deja comentado este)
+# *.zip
+
+# Carpetas de build de Compose/Gradle
+/build/
+**/build/
+**/compose/binaries/**
