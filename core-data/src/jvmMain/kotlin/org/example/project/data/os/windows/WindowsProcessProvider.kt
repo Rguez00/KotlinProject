@@ -51,6 +51,12 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
     @Volatile private var exeCache: Map<Long, EnrichedRow> = emptyMap()
     @Volatile private var exeCacheAt: Long = 0L
 
+    // --- Suavizado (EMA) para la gráfica/summary ---
+    @Volatile private var cpuEma: Double? = null
+    @Volatile private var memEma: Double? = null
+    private fun ema(curr: Double, last: Double?, alpha: Double = 0.30): Double =
+        last?.let { alpha * curr + (1 - alpha) * it } ?: curr
+
     private fun now() = System.currentTimeMillis()
     private fun userCacheExpired() = (now() - userCacheAt) > USER_TTL_MS
     private fun cpuCacheValid(): Boolean {
@@ -160,9 +166,12 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
                     val total = mx.totalPhysicalMemorySize.toDouble()
                     val free  = mx.freePhysicalMemorySize.toDouble()
                     val memPct = if (total > 0) ((total - free) / total) * 100.0 else 0.0
+                    val cpuSm = ema(cpuMx.coerceIn(0.0, 100.0), cpuEma)
+                    val memSm = ema(memPct.coerceIn(0.0, 100.0), memEma, alpha = 0.25)
+                    cpuEma = cpuSm; memEma = memSm
                     return@runCatching SystemSummary(
-                        totalCpuPercent = cpuMx.coerceIn(0.0, 100.0),
-                        totalMemPercent = memPct.coerceIn(0.0, 100.0)
+                        totalCpuPercent = cpuSm,
+                        totalMemPercent = memSm
                     )
                 }
             }
@@ -170,7 +179,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
 
         // 2) typeperf (rápido) / 3) wmic / 4) PowerShell (si no es FAST_MODE)
         val cpuDirect = if (FAST_MODE) {
-            readCpuTotalViaTypeperf()
+            readCpuTotalViaTypeperf(samples = 3)       // <-- promedio 3 muestras
         } else {
             readCpuTotalAny()
         }
@@ -179,16 +188,21 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         val cpuFallback = cpuDirect ?: sumPerProcessCpu()
 
         val mem = readMemPercentViaWmic() ?: 0.0
+
+        // Suavizado final para UI
+        val cpuSm = ema(cpuFallback.coerceIn(0.0, 100.0), cpuEma)
+        val memSm = ema(mem.coerceIn(0.0, 100.0), memEma, alpha = 0.25)
+        cpuEma = cpuSm; memEma = memSm
+
         SystemSummary(
-            totalCpuPercent = cpuFallback.coerceIn(0.0, 100.0),
-            totalMemPercent = mem.coerceIn(0.0, 100.0)
+            totalCpuPercent = cpuSm,
+            totalMemPercent = memSm
         )
     }
 
     /** Fallback: estima CPU total sumando el % de cada proceso y capando a 100. */
     private fun sumPerProcessCpu(): Double {
         val map = readCpuSample()
-        // algunos contadores pueden superar 100 puntual: promediamos y capamos
         val sum = map.values.sum()
         return when {
             sum.isNaN() -> 0.0
@@ -196,7 +210,6 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
             else        -> sum.coerceAtMost(100.0)
         }
     }
-
 
     /* ===================== Implementación ===================== */
 
@@ -301,12 +314,13 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
     /** Fallback CIM (PS) sólo si WMIC no dio datos y NO estamos en FAST_MODE */
     private fun readWmiCsvExecutablePath(): Map<Long, EnrichedRow> {
         if (FAST_MODE) return emptyMap()
+
         val psBody = """
-            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
-            Get-CimInstance Win32_Process |
-              Select-Object ProcessId, ExecutablePath, @{n='WS';e={${'$'}_.WorkingSetSize}} |
-              ConvertTo-Csv -NoTypeInformation -Delimiter '§'
-        """.trimIndent()
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+        Get-CimInstance Win32_Process |
+          Select-Object ProcessId, ExecutablePath, @{n='WS';e=${'$'}_.WorkingSetSize} |
+          ConvertTo-Csv -NoTypeInformation -Delimiter '§'
+    """.trimIndent()
 
         val csv = runPsUtf8(psBody).trim()
         val lines = csv.lines().filter { it.isNotBlank() }
@@ -328,6 +342,7 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         }
         return map
     }
+
 
     /* ---------- CPU% por proceso ---------- */
     private fun readCpuSample(): Map<Long, Double> {
@@ -372,26 +387,31 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
         return ((t - f).toDouble() / t.toDouble()) * 100.0
     }
 
-    private fun readCpuTotalViaTypeperf(): Double? {
-        val (text, exit) = runCmdRobust("\"$TYPEPERF_EXE\" \"\\Processor(_Total)\\% Processor Time\" -sc 1")
+    // --- PROMEDIO de varias muestras con typeperf ---
+    private fun readCpuTotalViaTypeperf(samples: Int = 3, intervalSec: Int = 1): Double? {
+        val cmd = "\"$TYPEPERF_EXE\" \"\\Processor(_Total)\\% Processor Time\" -si $intervalSec -sc $samples"
+        val (text, exit) = runCmdRobust(cmd)
         if (exit != 0 || text.isBlank()) return null
-        val line = text.lines().lastOrNull { it.contains('%') || it.count { ch -> ch == ',' || ch == '.' } >= 1 } ?: return null
-        val parts = splitCsvLine(line, ',')
-        val raw = parts.lastOrNull()?.replace('"', ' ')?.trim()
-        val num = raw?.replace(',', '.')?.toDoubleOrNull() ?: return null
-        return num.coerceIn(0.0, 100.0)
+
+        val values = text.lineSequence()
+            .map { it.substringAfterLast(',').replace("\"", "").trim().replace(',', '.') }
+            .mapNotNull { it.toDoubleOrNull() }
+            .toList()
+
+        if (values.isEmpty()) return null
+        return values.average().coerceIn(0.0, 100.0)
     }
 
     /** CPU total [%] por la vía más disponible: typeperf -> wmic -> PowerShell (evitado en FAST_MODE) */
     private fun readCpuTotalAny(): Double? {
-        // 1) typeperf
-        runCmdRobust("\"$TYPEPERF_EXE\" \"\\Processor(_Total)\\% Processor Time\" -sc 1").let { (text, exit) ->
+        // 1) typeperf con promedio de 3
+        runCmdRobust("\"$TYPEPERF_EXE\" \"\\Processor(_Total)\\% Processor Time\" -si 1 -sc 3").let { (text, exit) ->
             if (exit == 0 && text.isNotBlank()) {
-                val line = text.lines().lastOrNull { it.contains('%') || it.count { ch -> ch == ',' || ch == '.' } >= 1 }
-                val parts = line?.split(',')
-                val raw = parts?.lastOrNull()?.replace("\"", "")?.trim()
-                val v = raw?.replace(',', '.')?.toDoubleOrNull()
-                if (v != null) return v.coerceIn(0.0, 100.0)
+                val values = text.lineSequence()
+                    .map { it.substringAfterLast(',').replace("\"", "").trim().replace(',', '.') }
+                    .mapNotNull { it.toDoubleOrNull() }
+                    .toList()
+                if (values.isNotEmpty()) return values.average().coerceIn(0.0, 100.0)
             }
         }
         // 2) wmic
@@ -399,7 +419,9 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
             if (exit == 0 && text.isNotBlank()) {
                 val v = text.lineSequence()
                     .firstOrNull { it.startsWith("LoadPercentage", ignoreCase = true) }
-                    ?.substringAfter('=')?.trim()?.toDoubleOrNull()
+                    ?.substringAfter('=')
+                    ?.trim()
+                    ?.toDoubleOrNull()
                 if (v != null) return v.coerceIn(0.0, 100.0)
             }
         }
@@ -492,10 +514,10 @@ class WindowsProcessProvider : ProcessProvider, SystemInfoProvider {
     }
 
     private fun normalizeWinPath(raw: String?): String? = raw?.let {
-        // \\?\UNC\Server\Share\path  ->  \\Server\Share\path
-        it.replaceFirst(Regex("""^\\\\\?\\UNC\\"""), """\\""")
-            // \\?\C:\path -> C:\path
-            .replaceFirst(Regex("""^\\\\\?\\"""), "")
+        it.replaceFirst(Regex("""^\\\\\?\\UNC\\"""),
+            """\\""")
+            .replaceFirst(Regex("""^\\\\\?\\"""),
+                "")
     }
 
     /* ---------- Log %TEMP% ---------- */
