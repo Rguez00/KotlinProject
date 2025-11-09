@@ -5,7 +5,7 @@ Aplicación de escritorio en **Kotlin + Compose** para **listar procesos** del s
 **detalles** y **exportación a CSV**. Proyecto de **DI/PSP – 2º DAM**.
 
 - **Repositorio:** https://github.com/Rguez00/KotlinProject
-- **Memoria (PDF):** ver `/docs/Memoria_Final.pdf` (estructura completa, pruebas y anexos)
+- **Memoria (PDF):** ver `Documentacion.pdf` (estructura completa, pruebas y anexos)
 - **Descargas listas para usar (artefactos de entrega):**
     - `MonitorDeProcesosWindows.zip` → ejecutable/instalador para **Windows 10/11**
     - `MonitorDeProcesosUbuntu.zip` → binario/paquete para **Ubuntu 22.04/24.04**
