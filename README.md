@@ -24,7 +24,6 @@ Aplicación de escritorio en **Kotlin + Compose** para **listar procesos** del s
 **Ubuntu**
 1. Descarga `MonitorDeProcesosUbuntu.zip` y descomprímelo.
 2. Si es binario: `chmod +x ./MonitorDeProcesos` y ejecútalo.  
-   Si incluye `.deb/.rpm`, instala con tu gestor de paquetes.
 
 ---
 
