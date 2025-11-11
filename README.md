@@ -7,7 +7,7 @@ Aplicación de escritorio en **Kotlin + Compose** para **listar procesos** del s
 - **Repositorio:** https://github.com/Rguez00/KotlinProject
 - **Memoria (PDF):** ver `Documentacion.pdf` (estructura completa, pruebas y anexos)
 - **Descargas listas para usar (artefactos de entrega):**
-    - `MonitorDeProcesosWindows.zip` → ejecutable/instalador para **Windows 10/11**
+    - `MonitorDeProcesosWindows.zip` → ejecutable para **Windows 10/11**
     - `MonitorDeProcesosUbuntu.zip` → binario/paquete para **Ubuntu 22.04/24.04**
 
 > El README es un **resumen**; la explicación detallada está en el PDF.
@@ -18,7 +18,7 @@ Aplicación de escritorio en **Kotlin + Compose** para **listar procesos** del s
 
 **Windows**
 1. Descarga `MonitorDeProcesosWindows.zip` y descomprímelo.
-2. Ejecuta el **.exe** (o el lanzador incluido).  
+2. Ejecuta el **.exe**.  
    En el primer arranque verás “**Cargando procesos…**”.
 
 **Ubuntu**
