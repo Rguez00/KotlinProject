@@ -2,7 +2,7 @@
 
 Aplicación de escritorio en **Kotlin + Compose** para **listar procesos** del sistema con:
 **ordenación por cabecera**, **filtros** (Proceso/Usuario/Estado), **auto-refresco**,
-**detalles** y **exportación a CSV**. Proyecto de **DI/PSP – 2º DAM**.
+**detalles** y **exportación a CSV**. Proyecto de **PSP – 2º DAM**.
 
 - **Repositorio:** https://github.com/Rguez00/KotlinProject
 - **Memoria (PDF):** ver `Documentacion.pdf` (estructura completa, pruebas y anexos)
